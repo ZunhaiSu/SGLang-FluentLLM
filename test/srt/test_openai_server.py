@@ -297,7 +297,7 @@ class TestOpenAIServer(unittest.TestCase):
                     "url": "/v1/completions",
                     "body": {
                         "model": "gpt-3.5-turbo-instruct",
-                        "prompt": "List 6 names of famous tenniss player:  ",
+                        "prompt": "List 6 names of famous tennis player:  ",
                         "max_tokens": 40,
                     },
                 },
@@ -389,8 +389,8 @@ class TestOpenAIServer(unittest.TestCase):
         ]
         assert len(results) == len(content)
         for delete_fid in [uploaded_file.id, result_file_id]:
-            del_pesponse = client.files.delete(delete_fid)
-            assert del_pesponse.deleted
+            del_response = client.files.delete(delete_fid)
+            assert del_response.deleted
 
     def run_cancel_batch(self, mode):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
