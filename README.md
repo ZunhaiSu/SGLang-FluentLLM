@@ -28,3 +28,7 @@ We would also like to thank the broader LLM inference community. It is an honor 
 - We use [Dynamo](https://github.com/ai-dynamo/dynamo) for KVCache-aware request scheduling. As a result, in SGLang-FluentLLM we have removed SGLang’s sgl-model-gateway.
 - For multimodal models, we adopt a decoupled architecture that differs from the one used in the SGLang community. Therefore, multimodal support has also been removed from SGLang-FluentLLM itself (even in our internal setup, SGLang-FluentLLM is still used as the LLM backbone for multimodal inference).
 - Tested on Nvidia GPUs H800/H20.
+
+## How to Use
+
+Please refer to [Quick Start](https://github.com/meituan-longcat/SGLang-FluentLLM/blob/main/Quick_Start.md)

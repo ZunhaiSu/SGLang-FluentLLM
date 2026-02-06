@@ -34,14 +34,12 @@ MODEL_PATH=meituan-longcat/LongCat-Flash-Lite-FP8
 python3 -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
     --trust-remote-code \
-    --mem-fraction-static 0.8 \
+    --mem-fraction-static 0.85 \
     --port 10000 \
     --host 0.0.0.0 \
-    --chunked-prefill-size 1024 \
-    --low-latency-max-num-tokens-per-gpu 1024 \
+    --low-latency-max-num-tokens-per-gpu 2048 \
     --moe-parallel-strategy ep \
-    --dense-parallel-strategy tp \
-    --max-running-requests 64 \
+    --max-running-requests 32 \
     --nprocs-per-node 8 \
     --enable-flashinfer-mla \
     --attention-backend flashmla \
