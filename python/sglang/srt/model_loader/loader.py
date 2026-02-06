@@ -6,20 +6,19 @@ import dataclasses
 import fnmatch
 import glob
 import json
-import logging
+from sglang.srt.utils import get_colorful_logger
 import math
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Type, cast
+import yaml
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
-import gguf
 import huggingface_hub
 import numpy as np
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from transformers import AutoModelForCausalLM, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.srt.configs.device_config import DeviceConfig
@@ -39,9 +38,7 @@ from sglang.srt.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
-    get_gguf_extra_tensor_names,
     get_quant_config,
-    gguf_quant_weights_iterator,
     initialize_dummy_weights,
     np_cache_weights_iterator,
     pt_weights_iterator,
@@ -52,6 +49,7 @@ from sglang.srt.utils import (
     is_pin_memory_available,
     set_weight_attrs,
 )
+from sglang.srt.models.extensible import ExtensibleLM
 
 
 @contextmanager
@@ -96,7 +94,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         # New parameters or parameters already on target device are untouched
 
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 def _get_quantization_config(
@@ -371,79 +369,36 @@ class DefaultModelLoader(BaseModelLoader):
                     # parameters onto device for processing and back off after.
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading(module)
+
+                if hasattr(module, "layout"):
+                    process_method = getattr(module.layout, "process_weights_after_loading", None)
+                    if process_method is not None:
+                        with device_loading_context(module, target_device):
+                            module.layout.process_weights_after_loading(module)
+                else:
+                    process_method = getattr(module, "process_weights_after_loading", None)
+                    if process_method is not None:
+                        with device_loading_context(module, target_device):
+                            module.process_weights_after_loading(module)
+
         return model.eval()
 
-
-class LayeredModelLoader(DefaultModelLoader):
-    """Model loader that loads weights layer by layer so that one can quantize a
-    layer before loading another to make the peak memory envelope smaller."""
-
+class ExtensibleModelLoader:
     def __init__(self, load_config: LoadConfig):
-        # Back to the default load format
         load_config.load_format = LoadFormat.AUTO
-        super().__init__(load_config)
+        self.base_lm_loader = DefaultModelLoader(load_config)
+        self.ext_yaml = load_config.ext_yaml
 
     def load_model(
         self,
-        *,
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-        torchao_config = global_server_args_dict.get("torchao_config")
-        target_device = torch.device(device_config.device)
-
-        with set_default_torch_dtype(model_config.dtype):
-            # Create model on meta device
-            with torch.device("meta"):
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                )
-
-            # Check model's layered load support
-            if not hasattr(model, "load_weights_to_module"):
-                raise ValueError(
-                    "LayeredModelLoader requires the model to have a "
-                    "`load_weights_to_module` method. "
-                    f"{model_config.model_path} does not support it."
-                )
-
-            # Get all weights from disk
-            weights = self._get_all_weights(model_config, model)
-
-            # Helper function to recursively fill the weights of a module
-            def fill_module(module, fqn: List[str], weights):
-                """
-                fqn: list of strings representing the fully qualified name of `module`.
-                """
-                # Layer by layer
-                for name, submod in module.named_children():
-                    fill_module(submod, fqn + [name], weights)
-
-                # First materialize on target device
-                module.to_empty(device=target_device, recurse=False)
-                fqn_path = ".".join(fqn)
-                # Fill weights
-                model.load_weights_to_module(
-                    fqn_path,
-                    weights,
-                )
-                # Quantize weights if applicable
-                if torchao_config and "proj" in fqn_path:
-                    # Note: `None` here is needed to indicate no filter, see
-                    # `apply_torchao_config_to_model` for details.
-                    apply_torchao_config_to_model(module, torchao_config, None)
-
-            # Start calling on root module
-            fill_module(model, [], weights)
-
-        if torchao_config:
-            model.torchao_applied = True
-
-        return model.eval()
+        with open(self.ext_yaml) as f:
+            ext_config = yaml.safe_load(f)
+        base_lm = self.base_lm_loader.load_model(model_config=model_config, device_config=device_config)
+        ext_lm = ExtensibleLM(base_lm=base_lm, ext_config=ext_config)
+        return ext_lm
 
 
 class DummyModelLoader(BaseModelLoader):
@@ -472,11 +427,16 @@ class DummyModelLoader(BaseModelLoader):
                     model_config,
                     self.load_config,
                 )
-
+            if getattr(model, "post_load_weights", None):
+                model.post_load_weights()
+            
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     quant_method.process_weights_after_loading(module)
+                process_method = getattr(module, "process_weights_after_loading", None)
+                if process_method is not None:
+                    module.process_weights_after_loading(module)
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
@@ -582,6 +542,9 @@ class ShardedStateLoader(BaseModelLoader):
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
+                    process_method = getattr(module, "process_weights_after_loading", None)
+                    if process_method is not None:
+                        module.process_weights_after_loading(module)
             rank = get_tensor_model_parallel_rank()
             pattern = os.path.join(
                 local_model_path,
@@ -1115,94 +1078,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
 
         return model.eval()
 
-
-class GGUFModelLoader(BaseModelLoader):
-    """
-    Model loader that can load GGUF files. This is useful for loading models
-    that are quantized with GGUF and saved in the GGUF format. This loader
-    supports loading both full models and sharded models.
-    """
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-        if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
-
-    def _prepare_weights(self, model_name_or_path: str):
-        if os.path.isfile(model_name_or_path):
-            return model_name_or_path
-        else:
-            raise ValueError(f"{model_name_or_path} is not a file.")
-
-    def _get_gguf_weights_map(self, model_config: ModelConfig):
-        """
-        GGUF uses this naming convention for their tensors from HF checkpoint:
-        `blk.N.BB.weight` and `blk.N.BB.bias`
-        where N signifies the block number of a layer, and BB signifies the
-        attention/mlp layer components.
-        See "Standardized tensor names" in
-        https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
-        """
-        config = model_config.hf_config
-        model_type = config.model_type
-        # hack: ggufs have a different name than transformers
-        if model_type == "cohere":
-            model_type = "command-r"
-        arch = None
-        for key, value in gguf.MODEL_ARCH_NAMES.items():
-            if value == model_type:
-                arch = key
-                break
-        if arch is None:
-            raise RuntimeError(f"Unknown gguf model_type: {model_type}")
-        num_layers = config.num_hidden_layers
-        name_map = gguf.get_tensor_name_map(arch, num_layers)
-        with torch.device("meta"):
-            dummy_model = AutoModelForCausalLM.from_config(config)
-        state_dict = dummy_model.state_dict()
-
-        gguf_to_hf_name_map = {}
-        for hf_name in state_dict:
-            name, suffix = hf_name.rsplit(".", 1)
-            gguf_name = name_map.get_name(name)
-            gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
-        return gguf_to_hf_name_map
-
-    def _get_weights_iterator(
-        self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
-    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        return gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
-
-    def download_model(self, model_config: ModelConfig) -> None:
-        self._prepare_weights(model_config.model_path)
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-    ) -> nn.Module:
-
-        local_model_path = self._prepare_weights(model_config.model_path)
-        gguf_weights_map = self._get_gguf_weights_map(model_config)
-        # we can only know if tie word embeddings after mapping weights
-        if "lm_head.weight" in get_gguf_extra_tensor_names(
-            local_model_path, gguf_weights_map
-        ):
-            model_config.hf_config.update({"tie_word_embeddings": True})
-
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
-            )
-        return model
-
-
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
@@ -1218,10 +1093,7 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     if load_config.load_format == LoadFormat.BITSANDBYTES:
         return BitsAndBytesModelLoader(load_config)
 
-    if load_config.load_format == LoadFormat.GGUF:
-        return GGUFModelLoader(load_config)
-
-    if load_config.load_format == LoadFormat.LAYERED:
-        return LayeredModelLoader(load_config)
+    if load_config.load_format == LoadFormat.EXTENSIBLE:
+        return ExtensibleModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

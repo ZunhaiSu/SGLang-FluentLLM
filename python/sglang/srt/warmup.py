@@ -1,4 +1,4 @@
-import logging
+from sglang.srt.utils import get_colorful_logger
 from typing import List
 
 import numpy as np
@@ -7,7 +7,7 @@ import tqdm
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-logger = logging.getLogger(__file__)
+logger = get_colorful_logger(__name__)
 
 _warmup_registry = {}
 

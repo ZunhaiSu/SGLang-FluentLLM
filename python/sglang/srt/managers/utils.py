@@ -1,10 +1,10 @@
-import logging
+from sglang.srt.utils import get_colorful_logger
 from http import HTTPStatus
 from typing import Optional
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req import FINISH_ABORT, Req
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 def validate_input_length(

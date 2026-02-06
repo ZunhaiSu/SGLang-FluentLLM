@@ -22,6 +22,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
+from sglang.srt.utils import is_npu
+_is_npu = is_npu()
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -35,8 +37,16 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.dp_attention import (
+    get_dense_tp_size, get_dense_tp_rank
+)
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -44,6 +54,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.utils import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
@@ -56,18 +68,49 @@ class Qwen2MoeMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-        )
+        self.tp_size, self.tp_rank = None, None
+        self.layout = global_server_args_dict["dense_parallel_strategy"]
+        if self.layout == DenseParallelStategy.TENSOR_PARALLEL:
+            self.tp_size = get_dense_tp_size() if not _is_npu else get_tensor_model_parallel_world_size()
+            self.tp_rank = get_dense_tp_rank() if not _is_npu else get_tensor_model_parallel_rank()
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                reduce_results=reduce_results,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+            )
+        else:
+            self.gate_up_proj = ReplicatedLinear(
+                hidden_size,
+                intermediate_size * 2,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+            )
+            self.down_proj = ReplicatedLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+            )
+        
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -76,6 +119,8 @@ class Qwen2MoeMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        if x.shape[0] == 0:
+            return x
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)

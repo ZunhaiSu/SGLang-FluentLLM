@@ -1,13 +1,13 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
 import enum
 import json
-import logging
+from sglang.srt.utils import get_colorful_logger
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
 from sglang.srt.utils import is_hip
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 class LoadFormat(str, enum.Enum):
@@ -17,11 +17,11 @@ class LoadFormat(str, enum.Enum):
     NPCACHE = "npcache"
     DUMMY = "dummy"
     SHARDED_STATE = "sharded_state"
-    GGUF = "gguf"
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
     JAX = "jax"
+    EXTENSIBLE = "extensible"
 
 
 @dataclass
@@ -52,6 +52,8 @@ class LoadConfig:
     model_loader_extra_config: Optional[Union[str, dict]] = field(default_factory=dict)
     ignore_patterns: Optional[Union[List[str], str]] = None
     decryption_key_file: Optional[str] = None
+
+    ext_yaml: str = None
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

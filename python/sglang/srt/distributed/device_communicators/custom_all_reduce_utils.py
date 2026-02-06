@@ -8,16 +8,23 @@ import pickle
 import subprocess
 import sys
 import tempfile
+from functools import wraps
 from itertools import product
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, TypeVar
 
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from typing_extensions import ParamSpec
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-from sglang.srt.utils import cuda_device_count_stateless
 
 logger = logging.getLogger(__name__)
+
+import pynvml
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 def update_environment_variables(envs: Dict[str, str]):
@@ -218,7 +225,7 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
 
     is_distributed = dist.is_initialized()
 
-    num_dev = cuda_device_count_stateless()
+    num_dev = torch.cuda.device_count()
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     if cuda_visible_devices is None:
         cuda_visible_devices = ",".join(str(i) for i in range(num_dev))
@@ -280,6 +287,49 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         cache = json.load(f)
     _gpu_p2p_access_cache = cache
     return _gpu_p2p_access_cache[f"{src}->{tgt}"]
+
+
+def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    @wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        pynvml.nvmlInit()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            pynvml.nvmlShutdown()
+
+    return wrapper
+
+
+@with_nvml_context
+def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
+    """
+    query if the set of gpus are fully connected by nvlink (1 hop)
+    """
+    handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+    for i, handle in enumerate(handles):
+        for j, peer_handle in enumerate(handles):
+            if i < j:
+                try:
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
+                    )
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                        return False
+                except pynvml.NVMLError:
+                    logger.exception(
+                        "NVLink detection failed. This is normal if your"
+                        " machine has no NVLink equipped."
+                    )
+                    return False
+    return True
+
+
+def is_weak_contiguous(inp: torch.Tensor):
+    return inp.is_contiguous() or (
+        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
+        == inp.numel() * inp.element_size()
+    )
 
 
 __all__ = ["gpu_p2p_access_check"]

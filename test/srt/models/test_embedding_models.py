@@ -20,6 +20,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import get_similarities
+from sglang.srt.utils import maybe_model_redirect
 
 MODELS = [
     ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
@@ -36,6 +37,7 @@ class TestEmbeddingModels(unittest.TestCase):
         mp.set_start_method("spawn", force=True)
 
     def _truncate_prompts(self, prompts, model_path):
+        model_path = maybe_model_redirect(model_path)
         config = AutoConfig.from_pretrained(model_path)
         max_length = getattr(config, "max_position_embeddings", 2048)
 
@@ -61,6 +63,7 @@ class TestEmbeddingModels(unittest.TestCase):
         torch_dtype,
         prefill_tolerance,
     ) -> None:
+        model_path = maybe_model_redirect(model_path)
         truncated_prompts = self._truncate_prompts(prompts, model_path)
 
         with HFRunner(

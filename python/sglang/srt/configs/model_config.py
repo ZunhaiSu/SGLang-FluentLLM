@@ -13,7 +13,7 @@
 # ==============================================================================
 
 import json
-import logging
+from sglang.srt.utils import get_colorful_logger
 import math
 from enum import IntEnum, auto
 from typing import List, Optional, Set, Union
@@ -21,16 +21,75 @@ from typing import List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.hf_transformers_utils import get_config, get_context_length
+from sglang.srt.hf_transformers_utils import (
+    get_config,
+    get_context_length,
+    get_generation_config,
+)
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.server_args import ServerArgs
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
+
+
+def override_model_config(model_config, ext_yaml):
+    import copy, yaml
+
+    with open(ext_yaml) as f:
+        ext_config = yaml.safe_load(f)
+
+    def update(a, b):
+        if isinstance(b, dict):
+            res = copy.deepcopy(a)
+            res.__dict__.update(b)
+            return res
+        else:
+            return b
+
+    override_model_config: dict = ext_config.get("override_model_config", {})
+    for k, v in override_model_config.items():
+        if hasattr(model_config, k):
+            old_v = model_config.__getattribute__(k)
+            new_v = update(old_v, v)
+            model_config.__setattr__(k, new_v)
+            logger.info(f"overrides model config {k=}]")
+
+def is_deepseek_nsa(config: PretrainedConfig) -> bool:
+    return (
+        config.architectures is not None
+        and config.architectures[0]
+        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", "FLASHForCausalLM"]
+        and getattr(config, "index_topk", None) is not None
+    )
+
+def is_dsa(config: PretrainedConfig) -> bool:
+    return (
+        config.architectures is not None
+        and config.architectures[0]
+        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", "FLASHForCausalLM"]
+        and getattr(config, "index_topk", None) is not None
+    )
+
+
+def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_head_dim
+
+
+def get_nsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_topk
+
+
+def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_nsa(config)
+    return config.index_n_heads
 
 
 class ModelConfig:
@@ -45,10 +104,16 @@ class ModelConfig:
         dtype: str = "auto",
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
+        enable_tbo: Optional[bool] = False,
+        enable_sbo: Optional[bool] = False,
+        is_draft_worker: Optional[bool] = False,
+        server_args: ServerArgs = None,
     ) -> None:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.enable_tbo = enable_tbo
+        self.enable_sbo = enable_sbo
 
         # Parse args
         self.model_override_args = json.loads(model_override_args)
@@ -61,8 +126,22 @@ class ModelConfig:
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
+            is_draft_worker=is_draft_worker,
             **kwargs,
         )
+        if getattr(self.hf_config, 'use_over_embedding', False):
+            self.use_over_embedding = self.hf_config.use_over_embedding
+            self.oe_ignore_tokens = self.hf_config.oe_ignore_tokens
+        else:
+            self.use_over_embedding = False
+
+        self.hf_generation_config = get_generation_config(
+            self.model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+
         self.hf_text_config = get_hf_text_config(self.hf_config)
 
         # Check model type
@@ -73,7 +152,7 @@ class ModelConfig:
         self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
         self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
         self.is_audio_model = is_audio_model(self.hf_config.architectures)
-        self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
+        self.is_longcat_model = is_longcat_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
@@ -110,7 +189,10 @@ class ModelConfig:
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "FLASHForCausalLM" in self.hf_config.architectures
+            or "FLASHForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -118,6 +200,11 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
+            self.index_head_dim = (
+                get_nsa_index_head_dim(self.hf_config)
+                if is_deepseek_nsa(self.hf_config)
+                else None
+            )
 
             # Handle rope scaling with yarn
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
@@ -134,6 +221,13 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+        elif "KimiLinearForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 72
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
 
@@ -152,6 +246,11 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+        self.num_attention_layers = self.num_hidden_layers
+        if "ShortcutMoEForCausalLM" in self.hf_config.architectures \
+            or "FLASHForCausalLM" in self.hf_config.architectures \
+            or ("FLASHForCausalLMNextN" in self.hf_config.architectures and getattr(self.hf_config, "nextn_use_scmoe", False)):
+            self.num_attention_layers = self.num_hidden_layers * 2
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization
@@ -160,6 +259,9 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
+
+        if server_args is not None and server_args.load_format == "extensible":
+            override_model_config(self, server_args.ext_yaml)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
@@ -250,9 +352,11 @@ class ModelConfig:
             "compressed-tensors",
             "experts_int8",
             "w8a8_int8",
+            "w8a8_fp8",
         ]
         compatible_quantization_methods = {
-            "w8a8_int8": ["compressed-tensors", "compressed_tensors"]
+            "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
+            "w8a8_fp8": ["compressed-tensors", "compressed_tensors"]
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
@@ -313,6 +417,19 @@ class ModelConfig:
         if eos_ids:
             # it can be either int or list of int
             eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+        if eos_ids is None:
+            eos_ids = set()
+        if self.hf_generation_config:
+            generation_eos_ids = getattr(
+                self.hf_generation_config, "eos_token_id", None
+            )
+            if generation_eos_ids:
+                generation_eos_ids = (
+                    {generation_eos_ids}
+                    if isinstance(generation_eos_ids, int)
+                    else set(generation_eos_ids)
+                )
+                eos_ids = eos_ids | generation_eos_ids
         return eos_ids
 
 
@@ -450,9 +567,15 @@ def is_image_gen_model(model_architectures: List[str]):
 def is_audio_model(model_architectures: List[str]):
     return False
 
-
-def is_encoder_decoder_model(model_architectures: List[str]):
-    return "MllamaForConditionalGeneration" in model_architectures
+def is_longcat_model(model_architectures: List[str]):
+    if (
+        "LlamaForCausalLM_MoE" in model_architectures
+        or "ShortcutMoEForCausalLM" in model_architectures
+        or "FLASHForCausalLM" in model_architectures
+    ):
+        return True
+    else:
+        return False
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

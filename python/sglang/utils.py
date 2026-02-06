@@ -53,24 +53,6 @@ def read_jsonl(filename: str):
             yield json.loads(line)
 
 
-def dump_state_text(filename: str, states: list, mode: str = "w"):
-    """Dump program state in a text file."""
-    from sglang.lang.interpreter import ProgramState
-
-    with open(filename, mode) as fout:
-        for i, s in enumerate(states):
-            if isinstance(s, str):
-                pass
-            elif isinstance(s, ProgramState):
-                s = s.text()
-            else:
-                s = str(s)
-
-            fout.write(
-                "=" * 40 + f" {i} " + "=" * 40 + "\n" + s + "\n" + "=" * 80 + "\n\n"
-            )
-
-
 class HttpResponse:
     def __init__(self, resp):
         self.resp = resp
@@ -433,11 +415,22 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
         self._mapping = mapping
+        self._fallback_fn = None
+
+    def add_fallback_fn(self, fallback_fn: Callable):
+        self._fallback_fn = fallback_fn
+
+    def __iadd__(self, other: "TypeBasedDispatcher"):
+        self._mapping.extend(other._mapping)
+        return self
 
     def __call__(self, obj: Any):
         for ty, fn in self._mapping:
             if isinstance(obj, ty):
                 return fn(obj)
+
+        if self._fallback_fn is not None:
+            return self._fallback_fn(obj)
         raise ValueError(f"Invalid object: {obj}")
 
 
@@ -481,3 +474,43 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         cleaned_chunk = trim_overlap(final_text, chunk_text)
         final_text += cleaned_chunk
         yield cleaned_chunk  # yield the non-overlapping portion
+
+
+def get_cat_reporter(model_name: str, app_key: str):
+    class EmptyCat:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    if not model_name:
+        return EmptyCat()
+
+    DEFAULT_CAT_TYPE="Metrics." + model_name
+    try:
+        from pycat import Cat
+        from functools import partial
+        if app_key is None:
+            app_key = "com.sankuai.friday.inference.fluent"
+        Cat.init_cat(app_key, disable_falcon=True)
+    except Exception as e:
+        logger.error(f"Error init Cat: {e}")
+        return EmptyCat()
+    else:
+        def log_transaction(t_type: str, t_name: str, duration: int, suceess: bool = True):
+            t = Cat.new_transaction(t_type, t_name)
+            if suceess:
+                t.duration = duration
+            else:
+                t.set_status(CatStatusEnum.EXCEPTION)
+            t.complete()
+
+        def log_duration(t_name: str, end: float, start: float = 0.0):
+            log_transaction(DEFAULT_CAT_TYPE, t_name, duration=int((end - start) * 1000000))
+
+        def log_count(t_name: str, count: float):
+            log_transaction(DEFAULT_CAT_TYPE, t_name, duration=int(count * 1000))
+
+        Cat.log_count = staticmethod(log_count)
+        Cat.log_duration = staticmethod(log_duration)
+        Cat.log_transaction = staticmethod(log_transaction)
+        Cat.log_batch_event = staticmethod(partial(Cat.log_batch_event, e_type=DEFAULT_CAT_TYPE))
+        return Cat

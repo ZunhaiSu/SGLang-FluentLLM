@@ -5,7 +5,7 @@
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
-import logging
+from sglang.srt.utils import get_colorful_logger
 import os
 import pickle
 import time
@@ -15,7 +15,7 @@ from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 import torch
 from torch.distributed import TCPStore
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 def ensure_divisibility(numerator, denominator):

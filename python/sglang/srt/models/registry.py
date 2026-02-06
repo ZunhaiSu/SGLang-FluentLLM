@@ -1,15 +1,16 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/models/registry.py
 
 import importlib
-import logging
+from sglang.srt.utils import get_colorful_logger
 import pkgutil
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
-
+from sglang.srt.utils import is_npu
+__is_npu__ = is_npu()
 import torch.nn as nn
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 @dataclass
@@ -72,9 +73,15 @@ def import_model_classes():
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
+            if __is_npu__:
+                cur_model_name = name.split(".")[-1]
+                tgt_model_strs = ["llava", "llavavid", "mllama", "qwen2_5_vl", "yivl", "deepseek_mha_nsa", "gpt_oss"]
+                if cur_model_name in tgt_model_strs:
+                    continue
             try:
                 module = importlib.import_module(name)
             except Exception as e:
+                raise e
                 logger.warning(f"Ignore import error when loading {name}. " f"{e}")
                 continue
             if hasattr(module, "EntryClass"):

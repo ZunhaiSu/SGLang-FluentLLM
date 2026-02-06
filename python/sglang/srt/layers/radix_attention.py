@@ -13,9 +13,20 @@
 # ==============================================================================
 """Radix attention."""
 
+from enum import Enum
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class AttentionType(Enum):
+    """
+    Attention type.
+    Use string to be compatible with `torch.compile`.
+    """
+
+    # Decoder attention between previous layer Q/K/V
+    DECODER = "decoder"
 
 
 class RadixAttention(nn.Module):
@@ -34,6 +45,7 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        attn_type: AttentionType = AttentionType.DECODER,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -49,6 +61,7 @@ class RadixAttention(nn.Module):
         self.is_cross_attention = is_cross_attention
         self.k_scale = None
         self.v_scale = None
+        self.attn_type = attn_type
 
     def forward(
         self,
@@ -57,13 +70,18 @@ class RadixAttention(nn.Module):
         v,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None
-            k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
-            v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+            if "k_pe" not in kwargs:
+                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+            else:
+                k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
+                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
 
         return forward_batch.attn_backend.forward(
-            q, k, v, self, forward_batch, save_kv_cache
+            q, k, v, self, forward_batch, save_kv_cache, **kwargs,
         )

@@ -29,6 +29,8 @@ def run_eval(args):
         from sglang.test.simple_eval_mmlu import MMLUEval
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        if args.mmlu_test_file is not None:
+            filename = args.mmlu_test_file
         eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "math":
         from sglang.test.simple_eval_math import MathEval
@@ -103,6 +105,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Server or API base url if not using http host and port.",
+    )
+    parser.add_argument(
+        "--mmlu-test-file",
+        type=str,
+        default=None,
+        help="Data file for MMLU eval.",
     )
     parser.add_argument(
         "--host", type=str, default="0.0.0.0", help="Default host is 0.0.0.0."

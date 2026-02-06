@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import kill_process_tree, maybe_model_redirect
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -17,13 +17,13 @@ from sglang.test.test_utils import (
 class TestDataParallelism(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.model = maybe_model_redirect(DEFAULT_MODEL_NAME_FOR_TEST)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--dp", "2"],
+            other_args=["--dp", "2", "--nprocs-per-node", "2"],
         )
 
     @classmethod
@@ -45,7 +45,7 @@ class TestDataParallelism(unittest.TestCase):
     def test_update_weight(self):
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
-            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+            json={"model_path": maybe_model_redirect(DEFAULT_MODEL_NAME_FOR_TEST)},
         )
 
         # check if the response is 200
@@ -56,7 +56,7 @@ class TestDataParallelism(unittest.TestCase):
 
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
-            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+            json={"model_path": maybe_model_redirect(DEFAULT_MODEL_NAME_FOR_TEST)},
         )
 
         # check if the response is 200

@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import openai
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import kill_process_tree, maybe_model_redirect
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 class TestLargeMaxNewTokens(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = maybe_model_redirect(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
@@ -48,7 +48,7 @@ class TestLargeMaxNewTokens(unittest.TestCase):
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        cls.tokenizer = get_tokenizer(maybe_model_redirect(DEFAULT_SMALL_MODEL_NAME_FOR_TEST))
 
     @classmethod
     def tearDownClass(cls):

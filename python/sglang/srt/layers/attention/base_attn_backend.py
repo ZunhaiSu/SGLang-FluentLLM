@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.disaggregation.utils import StepCounter
 
 
 class AttentionBackend(ABC):
@@ -29,7 +30,6 @@ class AttentionBackend(ABC):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
@@ -42,7 +42,6 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
@@ -53,6 +52,9 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
+    def register_step_counter(self, step_counter: StepCounter):
+        self.step_counter = step_counter
+
     def forward(
         self,
         q: torch.Tensor,
@@ -61,6 +63,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run forward on an attention layer."""
         if forward_batch.forward_mode.is_decode():
@@ -71,16 +74,31 @@ class AttentionBackend(ABC):
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **kwargs,
             )
         else:
-            return self.forward_extend(
+            if (not forward_batch.forward_mode.is_idle()
+                and getattr(self, "step_counter", None)
+                and not save_kv_cache
+            ):
+                self.step_counter.record_cache()
+
+            ret = self.forward_extend(
                 q,
                 k,
                 v,
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
+                **kwargs,
             )
+
+            if (not forward_batch.forward_mode.is_idle()
+                and getattr(self, "step_counter", None)
+                and save_kv_cache
+            ):
+                self.step_counter.record_cache()
+            return ret
 
     def forward_decode(
         self,
@@ -90,6 +108,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for decode."""
         raise NotImplementedError()
@@ -102,6 +121,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for extend."""
         raise NotImplementedError()

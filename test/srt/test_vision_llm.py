@@ -16,6 +16,9 @@ from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import maybe_model_redirect
+
+import os
 
 MiniCPMV = "openbmb/MiniCPM-V-2_6"
 
@@ -24,13 +27,14 @@ MiniCPMV = "openbmb/MiniCPM-V-2_6"
 class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+        # cls.image_url = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+        # 无法联网，改为本地路径：test/lang/example_image.png
+        cls.image_path = os.path.join(os.path.dirname(__file__), "../lang/example_image.png")
         cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         cls.model_path = ""
         cls.chat_template = ""
         cls.processor = ""
-        response = requests.get(cls.image_url)
-        cls.main_image = Image.open(BytesIO(response.content))
+        cls.main_image = Image.open(cls.image_path)
 
     def compare_outputs(self, sglang_output: torch.Tensor, hf_output: torch.Tensor):
         # Convert to float32 for numerical stability if needed
@@ -106,7 +110,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         {{
           "type": "image_url",
           "image_url": {{
-            "url": "{self.image_url}"
+            "url": "file://{self.image_path}"
           }}
         }},
         {{
@@ -137,7 +141,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
 
     def get_sglang_model(self):
         model_runner = ModelRunner(
-            model_config=ModelConfig(self.model_path, model_override_args="{}"),
+            model_config=ModelConfig(maybe_model_redirect(self.model_path), model_override_args="{}"),
             mem_fraction_static=0.8,
             gpu_id=0,
             tp_rank=0,
@@ -155,7 +159,7 @@ class TestMiniCPMVLogits(VisionLLMLogitsBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model_path = MiniCPMV
+        cls.model_path = maybe_model_redirect(MiniCPMV)
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model_path, trust_remote_code=True
         )

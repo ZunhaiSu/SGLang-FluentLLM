@@ -1,39 +1,34 @@
-import logging
+from sglang.srt.utils import get_colorful_logger
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.srt.distributed import get_tensor_model_parallel_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.env import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda_available
 
 if is_cuda_available():
-    from sgl_kernel import (
-        min_p_sampling_from_probs,
+    from flashinfer.sampling import (
         top_k_renorm_prob,
         top_k_top_p_sampling_from_probs,
         top_p_renorm_prob,
+        min_p_sampling_from_probs
     )
 
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
-
 
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
-        self.tp_sync_group = get_tensor_model_parallel_group().device_group
-
-        if global_server_args_dict["enable_dp_attention"]:
-            self.tp_sync_group = get_attention_tp_group().device_group
+        self.tp_sync_group = get_attention_tp_group().device_group
 
     def forward(
         self,
@@ -76,6 +71,8 @@ class Sampler(nn.Module):
                 batch_next_token_ids = torch.argmax(logits, -1)
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+                # To return logits, uncomment the following
+                # logprobs = logits
         else:
             # Post process logits
             logits.div_(sampling_info.temperatures)
@@ -95,31 +92,22 @@ class Sampler(nn.Module):
                     ).clamp(min=torch.finfo(probs.dtype).min)
 
                 if batch_next_token_ids is None:
-                    max_top_k_round, batch_size = 32, probs.shape[0]
-                    uniform_samples = torch.rand(
-                        (max_top_k_round, batch_size), device=probs.device
-                    )
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
                         batch_next_token_ids = min_p_sampling_from_probs(
-                            probs, uniform_samples, sampling_info.min_ps
+                            probs, sampling_info.min_ps
                         )
                     else:
-                        batch_next_token_ids, success = top_k_top_p_sampling_from_probs(
+                        # Check Nan will throw exception, only check when crash_on_warnings is True
+                        check_nan = self.use_nan_detection and crash_on_warnings()
+                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
                             probs,
-                            uniform_samples,
                             sampling_info.top_ks,
                             sampling_info.top_ps,
                             filter_apply_order="joint",
+                            check_nan=check_nan,
                         )
-
-                        if self.use_nan_detection and not torch.all(success):
-                            logger.warning("Detected errors during sampling!")
-                            batch_next_token_ids = torch.zeros_like(
-                                batch_next_token_ids
-                            )
-
             elif global_server_args_dict["sampling_backend"] == "pytorch":
                 if batch_next_token_ids is None:
                     # A slower fallback implementation with torch native operations.

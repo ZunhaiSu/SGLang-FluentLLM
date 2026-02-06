@@ -1,41 +1,30 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
-import logging
-import os
 from typing import List, Tuple
 
 import torch
-import torch.library
 
-from sglang.srt.utils import is_hip, is_hpu
+from sglang.srt.utils import get_colorful_logger, is_npu
 
-logger = logging.getLogger(__name__)
-use_vllm_custom_allreduce = os.environ.get("USE_VLLM_CUSTOM_ALLREDUCE", default=True)
+logger = get_colorful_logger(__name__)
 
-if not is_hpu():
-    # ROCm does not use vllm custom allreduce
-    if use_vllm_custom_allreduce and not is_hip():
-        try:
-            import vllm._C
-        except ImportError as e:
-            logger.warning("Failed to import from vllm._C with %r", e)
-    else:
-        try:
-            import sgl_kernel
-        except ImportError as e:
-            logger.warning("Failed to import from custom_ar with %r", e)
+try:
+    from flashinfer.comm import vllm_ar as flashinfer_ar
+except ImportError:
+    raise ImportError("flashinfer not correctly installed!")
 
 
-if use_vllm_custom_allreduce and not is_hip():
-    # vLLM custom allreduce
+
+if not is_npu():
+    custom_op = flashinfer_ar
+
+    # custom allreduce
     def init_custom_ar(
-        ipc_tensors: List[torch.Tensor],
+        ipc_tensors: List[int],
         rank_data: torch.Tensor,
         rank: int,
         full_nvlink: bool,
     ) -> int:
-        return torch.ops._C_custom_ar.init_custom_ar(
-            ipc_tensors, rank_data, rank, full_nvlink
-        )
+        return custom_op.init_custom_ar(ipc_tensors, rank_data, rank, full_nvlink)
 
     def all_reduce(
         fa: int,
@@ -43,106 +32,23 @@ if use_vllm_custom_allreduce and not is_hip():
         out: torch.Tensor,
         reg_buffer: int,
         reg_buffer_sz_bytes: int,
+        num_ctas: int = 4,
     ) -> None:
-        torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+        custom_op.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes, num_ctas)
 
     def dispose(fa: int) -> None:
-        torch.ops._C_custom_ar.dispose(fa)
+        custom_op.dispose(fa)
 
     def meta_size() -> int:
-        return torch.ops._C_custom_ar.meta_size()
+        return custom_op.meta_size()
 
     def register_buffer(fa: int, ipc_tensors: List[int]) -> None:
-        return torch.ops._C_custom_ar.register_buffer(fa, ipc_tensors)
+        return custom_op.register_buffer(fa, ipc_tensors)
 
     def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
-        return torch.ops._C_custom_ar.get_graph_buffer_ipc_meta(fa)
+        return custom_op.get_graph_buffer_ipc_meta(fa)
 
     def register_graph_buffers(
         fa: int, handles: List[List[int]], offsets: List[List[int]]
     ) -> None:
-        torch.ops._C_custom_ar.register_graph_buffers(fa, handles, offsets)
-
-else:
-    if is_hip():
-        # ROCM custom allreduce
-
-        def init_custom_ar(
-            meta: torch.Tensor,
-            rank_data: torch.Tensor,
-            handles: List[str],
-            offsets: List[int],
-            rank: int,
-            full_nvlink: bool,
-        ) -> int:
-            return sgl_kernel.ops.init_custom_ar(
-                meta, rank_data, handles, offsets, rank, full_nvlink
-            )
-
-        def all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
-            sgl_kernel.ops.all_reduce_reg(fa, inp, out)
-
-        def all_reduce_unreg(
-            fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
-        ) -> None:
-            sgl_kernel.ops.all_reduce_unreg(fa, inp, reg_buffer, out)
-
-        def dispose(fa: int) -> None:
-            sgl_kernel.ops.dispose(fa)
-
-        def meta_size() -> int:
-            return sgl_kernel.ops.meta_size()
-
-        def register_buffer(
-            fa: int, t: torch.Tensor, handles: List[str], offsets: List[int]
-        ) -> None:
-            return sgl_kernel.ops.register_buffer(fa, t, handles, offsets)
-
-        def get_graph_buffer_ipc_meta(fa: int) -> Tuple[torch.Tensor, List[int]]:
-            return sgl_kernel.ops.get_graph_buffer_ipc_meta(fa)
-
-        def register_graph_buffers(
-            fa: int, handles: List[str], offsets: List[List[int]]
-        ) -> None:
-            sgl_kernel.ops.register_graph_buffers(fa, handles, offsets)
-
-        def allocate_meta_buffer(size: int) -> torch.Tensor:
-            return sgl_kernel.ops.allocate_meta_buffer(size)
-
-        def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
-            return sgl_kernel.ops.get_meta_buffer_ipc_handle(inp)
-
-    else:
-        # TRTLLM custom allreduce
-        def init_custom_ar(
-            rank_id: int,
-            world_size: int,
-            rank_data_base: torch.Tensor,
-            buffers: List[int],
-            tmp_result_buffers: List[int],
-            barrier_in: List[int],
-            barrier_out: List[int],
-        ) -> int:
-            return sgl_kernel.ops.init_custom_reduce(
-                rank_id,
-                world_size,
-                rank_data_base,
-                buffers,
-                tmp_result_buffers,
-                barrier_in,
-                barrier_out,
-            )
-
-        def all_reduce(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
-            sgl_kernel.ops.custom_reduce(fa, inp, out)
-
-        def dispose(fa: int) -> None:
-            sgl_kernel.ops.custom_dispose(fa)
-
-        def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
-            return sgl_kernel.ops.get_graph_buffer_ipc_meta(fa)
-
-        def register_graph_buffers(
-            fa: int, handles: List[List[int]], offsets: List[List[int]]
-        ) -> None:
-            sgl_kernel.ops.register_graph_buffers(fa, handles, offsets)
+        custom_op.register_graph_buffers(fa, handles, offsets)

@@ -1,6 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/shm_broadcast.py
 
-import logging
+from sglang.srt.utils import get_colorful_logger
 import os
 import pickle
 import time
@@ -23,7 +23,7 @@ SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
     os.environ.get("SGLANG_RINGBUFFER_WARNING_INTERVAL", "60")
 )
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 class ShmRingBuffer:

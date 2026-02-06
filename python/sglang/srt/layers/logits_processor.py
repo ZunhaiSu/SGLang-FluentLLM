@@ -14,7 +14,7 @@
 """Logits processing."""
 
 import dataclasses
-import logging
+from sglang.srt.utils import get_colorful_logger
 from typing import List, Optional, Union
 
 import torch
@@ -25,6 +25,7 @@ from torch import nn
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    get_tensor_model_parallel_group
 )
 from sglang.srt.layers.dp_attention import (
     dp_gather,
@@ -40,7 +41,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.utils import dump_to_file
 
-logger = logging.getLogger(__name__)
+from sglang.srt.utils import (is_npu)
+
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allgather_vocab
+
+logger = get_colorful_logger(__name__)
 
 
 @dataclasses.dataclass
@@ -204,7 +210,7 @@ class LogitsProcessor(nn.Module):
         ):
             self.final_logit_softcapping = None
 
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
+        from sglang.srt.env import global_server_args_dict
 
         self.debug_tensor_dump_output_folder = global_server_args_dict[
             "debug_tensor_dump_output_folder"
@@ -216,8 +222,14 @@ class LogitsProcessor(nn.Module):
         hidden_states,
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        aux_hidden_states: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         if isinstance(logits_metadata, ForwardBatch):
+            spec_info = logits_metadata.spec_info
+            if logits_metadata.forward_mode.is_draft_extend():
+                hidden_states = hidden_states[spec_info.accept_index]
+                if aux_hidden_states is not None:
+                    aux_hidden_states = [aux_hidden_state[spec_info.accept_index] for aux_hidden_state in aux_hidden_states]
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Get the last hidden states and last logits for the next token prediction
@@ -226,6 +238,8 @@ class LogitsProcessor(nn.Module):
             or logits_metadata.forward_mode.is_target_verify()
         ):
             pruned_states = hidden_states
+            if aux_hidden_states is not None:
+                aux_pruned_states = [hidden for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
         elif (
@@ -249,6 +263,8 @@ class LogitsProcessor(nn.Module):
                     - 1
                 )
             pruned_states = hidden_states[last_index]
+            if aux_hidden_states is not None:
+                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -312,13 +328,27 @@ class LogitsProcessor(nn.Module):
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
-                hidden_states_to_store = hidden_states
+                if aux_hidden_states is not None:
+                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
+                    hidden_states_to_store = aux_hidden_states
+                else:
+                    hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
-                hidden_states_to_store = (
-                    pruned_states[sample_indices] if sample_indices else pruned_states
-                )
+                if aux_hidden_states is not None:
+                    aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
+                    hidden_states_to_store = (
+                        aux_pruned_states[sample_indices]
+                        if sample_indices is not None
+                        else aux_pruned_states
+                    )
+                else:
+                    hidden_states_to_store = (
+                        pruned_states[sample_indices]
+                        if sample_indices is not None
+                        else pruned_states
+                    )
             else:
                 assert False, "Should never reach"
 
@@ -417,7 +447,15 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if self.do_tensor_parallel_all_gather:
-            logits = tensor_model_parallel_all_gather(logits)
+            if logits.shape[0] < global_server_args_dict["flashinfer_comm_max_num_tokens"]:
+                logits = flashinfer_allgather_vocab(
+                    logits,
+                    group=get_tensor_model_parallel_group(),
+                    max_tokens_num=global_server_args_dict["flashinfer_comm_max_num_tokens"],
+                    local_vocab_size=logits.shape[-1]
+                )
+            else:
+                logits = tensor_model_parallel_all_gather(logits)
 
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits, global_logits = (
@@ -433,7 +471,7 @@ class LogitsProcessor(nn.Module):
         logits = logits[:, : self.config.vocab_size].float()
 
         if self.final_logit_softcapping:
-            fused_softcap(logits, self.final_logit_softcapping)
+            fused_softcap_generic(logits, self.final_logit_softcapping)
 
         return logits
 
@@ -559,3 +597,21 @@ def fused_softcap(full_logits, final_logit_softcapping):
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return full_logits
+
+def fused_softcap_npu(full_logits, final_logit_softcapping):
+    """
+    NPU-compatible fused_softcap implementation.
+    full_logits: [N, vocab_size], on NPU
+    final_logit_softcapping: float scalar
+    """
+    x = full_logits / final_logit_softcapping
+    x = torch.tanh(x)
+    x = x * final_logit_softcapping
+    return x
+
+def fused_softcap_generic(full_logits, final_logit_softcapping):
+    if is_npu():
+        return fused_softcap_npu(full_logits, final_logit_softcapping)
+    else:
+        return fused_softcap(full_logits, final_logit_softcapping)
+

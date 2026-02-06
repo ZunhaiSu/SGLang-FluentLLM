@@ -14,7 +14,6 @@
 """Constrained decoding with xgrammar backend."""
 
 import json
-import logging
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -32,8 +31,9 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sglang.srt.utils import get_colorful_logger
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 MAX_ROLLBACK_TOKENS = 200
@@ -53,9 +53,27 @@ class XGrammarGrammar(BaseGrammarObject):
         self.ctx = ctx
         self.override_stop_tokens = override_stop_tokens
         self.finished = False
+        self.accepted_tokens = []
+
+    def is_terminated(self):
+        return self.matcher.is_terminated()
 
     def accept_token(self, token: int):
-        assert self.matcher.accept_token(token)
+        if not self.is_terminated():
+            accepted = self.matcher.accept_token(token)
+            if not accepted:
+                # log for debugging
+                raise ValueError(
+                    f"Tokens not accepted: {token}\n"
+                    f"Accepted tokens: {self.accepted_tokens}\n"
+                    f"Terminated: {self.matcher.is_terminated()}\n"
+                )
+        else:
+            self.accepted_tokens.append(token)
+
+    def rollback(self, k: int):
+        self.matcher.rollback(k)
+        self.accepted_tokens = self.accepted_tokens[:-k]
 
     def try_jump_forward(self, tokenizer) -> Tuple[List[int], str]:
         s = self.matcher.find_jump_forward_string()
@@ -138,7 +156,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 else:
                     ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
             except RuntimeError as e:
-                logging.warning(
+                logger.warning(
                     f"Skip invalid json_schema: json_schema={key_string}, {e=}"
                 )
                 return None
@@ -146,13 +164,13 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             try:
                 ctx = self.grammar_compiler.compile_grammar(key_string)
             except RuntimeError as e:
-                logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
+                logger.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
                 return None
         elif key_type == "regex":
             try:
                 ctx = self.grammar_compiler.compile_regex(key_string)
             except RuntimeError as e:
-                logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+                logger.warning(f"Skip invalid regex: regex={key_string}, {e=}")
                 return None
         elif key_type == "structural_tag":
             try:
@@ -169,7 +187,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     tags, structural_tag["triggers"]
                 )
             except RuntimeError as e:
-                logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+                logger.warning(f"Skip invalid regex: regex={key_string}, {e=}")
                 return None
         else:
             raise ValueError(f"Invalid key_type: {key_type}")
@@ -180,3 +198,6 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def reset(self):
         if self.grammar_compiler:
             self.grammar_compiler.clear_cache()
+
+    def reset_vocab_masks(self, vocab_masks: torch.Tensor):
+        torch.fill_(vocab_masks, -1)

@@ -64,6 +64,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    cached_tokens: int = 0  # Number of cached tokens in the prompt
 
 
 def remove_prefix(text: str, prefix: str) -> str:
@@ -335,7 +336,6 @@ async def async_request_sglang_generate(
                 "ignore_eos": not args.disable_ignore_eos,
             },
             "stream": not args.disable_stream,
-            "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
             "logprob_start_len": -1,
             **request_func_input.extra_request_body,
@@ -347,6 +347,7 @@ async def async_request_sglang_generate(
 
         generated_text = ""
         output_len = request_func_input.output_len
+        cached_tokens = 0
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
@@ -376,6 +377,9 @@ async def async_request_sglang_generate(
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
+                                # Extract cached tokens from meta_info
+                                if "cached_tokens" in data["meta_info"]:
+                                    cached_tokens = data["meta_info"]["cached_tokens"]
 
                                 # First token
                                 if ttft == 0.0:
@@ -394,11 +398,18 @@ async def async_request_sglang_generate(
 
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
+                            else:
+                                timestamp = time.perf_counter()
+                                adjust_itl = timestamp - most_recent_timestamp
+                                output.itl.extend([adjust_itl])
+                                most_recent_timestamp = timestamp
+                                print(f"adjust_itl: {adjust_itl}")
 
                     output.generated_text = generated_text
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    output.cached_tokens = cached_tokens
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -549,6 +560,9 @@ class BenchmarkMetrics:
     std_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
+    total_cached_tokens: int
+    cache_hit_rate: float
+    avg_cached_tokens_per_request: float
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -880,6 +894,7 @@ def calculate_metrics(
     retokenized_output_lens: List[int] = []
     total_input = 0
     completed = 0
+    total_cached_tokens = 0
     itls: List[float] = []
     tpots: List[float] = []
     ttfts: List[float] = []
@@ -893,6 +908,8 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i][1]
+            # Collect cached tokens
+            total_cached_tokens += outputs[i].cached_tokens
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
@@ -911,6 +928,13 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2,
         )
+    # Calculate cache hit rate metrics
+    cache_hit_rate = 0.0
+    avg_cached_tokens_per_request = 0.0
+    if completed > 0 and total_input > 0:
+        cache_hit_rate = total_cached_tokens / total_input * 100.0
+        avg_cached_tokens_per_request = total_cached_tokens / completed
+    
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -943,6 +967,9 @@ def calculate_metrics(
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
+        total_cached_tokens=total_cached_tokens,
+        cache_hit_rate=cache_hit_rate,
+        avg_cached_tokens_per_request=avg_cached_tokens_per_request,
     )
 
     return metrics, output_lens
@@ -965,6 +992,7 @@ async def benchmark(
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
+        print(f"backend: {backend}")
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -1054,7 +1082,15 @@ async def benchmark(
                 "avg_spec_accept_length", None
             )
         else:
-            accept_length = server_info.json().get("avg_spec_accept_length", None)
+            internal_states = server_info.json().get("internal_states")
+            if isinstance(internal_states, list) and len(internal_states) > 0:
+                # internal_states is a list of dictionaries, take the first one
+                accept_length = internal_states[0].get("avg_spec_accept_length", None)
+            elif isinstance(internal_states, dict):
+                # internal_states is a single dictionary (legacy format)
+                accept_length = internal_states.get("avg_spec_accept_length", None)
+            else:
+                accept_length = None
     else:
         accept_length = None
 
@@ -1086,6 +1122,9 @@ async def benchmark(
             "Total generated tokens (retokenized):", metrics.total_output_retokenized
         )
     )
+    print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached_tokens))
+    print("{:<40} {:<10.2f}%".format("Cache hit rate:", metrics.cache_hit_rate))
+    print("{:<40} {:<10.2f}".format("Avg cached tokens/request:", metrics.avg_cached_tokens_per_request))
     print(
         "{:<40} {:<10.2f}".format(
             "Request throughput (req/s):", metrics.request_throughput
@@ -1173,6 +1212,9 @@ async def benchmark(
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
+            "total_cached_tokens": metrics.total_cached_tokens,
+            "cache_hit_rate": metrics.cache_hit_rate,
+            "avg_cached_tokens_per_request": metrics.avg_cached_tokens_per_request,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")

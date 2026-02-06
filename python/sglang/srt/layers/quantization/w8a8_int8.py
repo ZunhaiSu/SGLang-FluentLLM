@@ -1,22 +1,10 @@
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
+
+from typing import Any, Dict, List, cast
 
 import torch
 
-from sglang.srt.utils import is_cuda_available
-
-is_cuda = is_cuda_available()
-if is_cuda:
-    from sgl_kernel import int8_scaled_mm
-
-from torch.nn.parameter import Parameter
-
-from sglang.srt.layers.linear import LinearMethodBase
-from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -26,8 +14,12 @@ class W8A8Int8Config(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self):
-        pass
+    def __init__(self, quant_config: Dict[str, Any] = {}):
+        super().__init__()
+        self.quant_description = quant_config
+        self.is_dynamic = quant_config.get("is_dynamic", False)
+        self.ignore = cast(List[str], quant_config.get("ignore", [])) or []
+        self.packed_modules_mapping = quant_config.get("packed_modules_mapping", {}) or {}
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -43,75 +35,12 @@ class W8A8Int8Config(QuantizationConfig):
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
-        return []
+        filenames = []
+        return filenames
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W8A8Int8Config":
-        return cls()
-
-    def get_quant_method(
-        self,
-        layer: torch.nn.Module,
-        prefix: str,
-    ) -> Optional["QuantizeMethodBase"]:
-        from sglang.srt.layers.linear import LinearBase
-
-        if isinstance(layer, LinearBase):
-            return W8A8Int8LinearMethod(self)
-        return None
+    def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
+        return cls(config)
 
     def get_scaled_act_names(self) -> List[str]:
         return []
-
-
-class W8A8Int8LinearMethod(LinearMethodBase):
-
-    def __init__(self, quantization_config: W8A8Int8Config):
-        self.quantization_config = quantization_config
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.weight = Parameter(layer.weight.t(), requires_grad=False)
-        layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs
-    ):
-
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        self.logical_widths = output_partition_sizes
-
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                sum(output_partition_sizes), input_size_per_partition, dtype=torch.int8
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
-
-        weight_scale = ChannelQuantScaleParameter(
-            data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ):
-        x_q, x_scale = per_token_quant_int8(x)
-
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
-        )

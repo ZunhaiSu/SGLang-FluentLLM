@@ -1,12 +1,11 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/linear.py"""
 
-import logging
-from abc import abstractmethod
+from sglang.srt.layers.dense.layouts.base import LinearBase
+from sglang.srt.utils import get_colorful_logger
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
-from torch.nn.parameter import Parameter, UninitializedParameter
+from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import (
     divide,
@@ -15,6 +14,7 @@ from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+    get_tp_group,
 )
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -22,15 +22,21 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
+    BlockQuantScaleParameter
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
-    QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.utils import set_weight_attrs
 
-logger = logging.getLogger(__name__)
+from sglang.srt.utils import is_npu
+from sglang.srt.env import global_server_args_dict
+
+__is_npu__ = is_npu()
+if __is_npu__:
+    import torch_npu
+
+logger = get_colorful_logger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
@@ -96,121 +102,6 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
     return param[shard_id], loaded_weight
 
 
-class LinearMethodBase(QuantizeMethodBase):
-    """Base class for different (maybe quantized) linear methods."""
-
-    @abstractmethod
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        """Create weights for a linear layer.
-           The weights will be set as attributes of the layer.
-
-        Args:
-            layer: The layer that is using the LinearMethodBase factory.
-            input_size_per_partition: Size of the weight input dim on rank X.
-            output_partition_sizes: Sizes of the output dim of each logical
-                weight on rank X. E.g., output_partition_sizes for QKVLinear
-                is a list contains the width of Wq, Wk, Wv on rank X.
-            input_size: Size of the input dim of the weight across all ranks.
-            output_size: Size of the output dim of the weight across all ranks.
-            params_dtype: Datatype of the parameters.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Apply the weights in layer to the input tensor.
-        Expects create_weights to have been called before on the layer."""
-        raise NotImplementedError
-
-
-class UnquantizedLinearMethod(LinearMethodBase):
-    """Linear method without quantization."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, extra_weight_attrs)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-
-        return F.linear(x, layer.weight, bias)
-
-
-class LinearBase(torch.nn.Module):
-    """Base linear layer.
-
-    Args:
-        input_size: input dimension of the linear layer.
-        output_size: output dimension of the linear layer.
-        bias: If true, add bias.
-        skip_bias_add: If true, skip adding bias but instead return it.
-        params_dtype: Data type for the parameters.
-        quant_config: Quantization configure.
-    """
-
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        skip_bias_add: bool = False,
-        params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-
-        # Keep input parameters
-        self.input_size = input_size
-        self.output_size = output_size
-        self.skip_bias_add = skip_bias_add
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
-        self.params_dtype = params_dtype
-        if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
-        else:
-            self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
-
-
 class ReplicatedLinear(LinearBase):
     """Replicated linear layer.
 
@@ -270,19 +161,31 @@ class ReplicatedLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor, shard_id=None, begin_size=None):
         # If the weight on disk does not have a shape, give it one
         # (such scales for AutoFp8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param.size() == loaded_weight.size()
-        param.data.copy_(loaded_weight)
+        if begin_size is not None:
+            shard_size = loaded_weight.shape[0]
+            param[begin_size: begin_size + shard_size].data.copy_(loaded_weight)
+        elif shard_id is not None:
+            shard_size = loaded_weight.shape[0]
+            param[shard_id*shard_size: (shard_id+1)*shard_size].data.copy_(loaded_weight)
+        else:
+            assert param.size() == loaded_weight.size()
+            param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, block_scale=None, output_dtype=None) -> torch.Tensor:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
+        if block_scale is not None:
+            # Note: block_scale is not None means flashinfer reduce-scatter fusion is used for fp8 block quant
+            # in this case, the input_ is already quantized to a fp8 tensor
+            output = self.quant_method.apply(self, x, bias, block_scale, output_dtype)
+        else:
+            output = self.quant_method.apply(self, x, bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -387,16 +290,6 @@ class ColumnParallelLinear(LinearBase):
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         output_dim = getattr(param, "output_dim", None)
 
-        # Special case for GGUF
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type:
-            param.weight_type = loaded_weight.item()
-
-        # Materialize GGUF UninitializedParameter
-        if is_gguf_weight and isinstance(param, UninitializedParameter):
-            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
-
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
 
         param_data = param.data
@@ -436,12 +329,17 @@ class ColumnParallelLinear(LinearBase):
             # However, we should fix this and avoid the branching here.
             param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, block_scale=None, output_dtype=None):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        if block_scale is not None:
+            # Note: block_scale is not None means flashinfer all-reduce fusion is used for fp8 block quant
+            # in this case, the input_ is already quantized to a fp8 tensor
+            output_parallel = self.quant_method.apply(self, input_, bias, block_scale, output_dtype)
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -525,30 +423,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[int] = None,
     ):
-
-        # Special case for GGUF
-        # initialize GGUF param after we know the quantize type
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type:
-            param.data[loaded_shard_id].copy_(loaded_weight)
-            param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
-            return
-
-        if is_gguf_weight:
-            output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
-
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-            param.shard_id.append(loaded_shard_id)
-            param.shard_id_map[loaded_shard_id] = len(param.data_container)
-            param.data_container.append(loaded_weight)
-            if len(param.data_container) == 2:
-                self.qweight = param.materialize_nested()
-            return
-
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
@@ -716,10 +590,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param.load_merged_column_weight(
             loaded_weight=loaded_weight,
             shard_id=loaded_shard_id,
+            tp_rank=self.tp_rank,
             shard_offset=shard_offset,
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
         )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if __is_npu__:
+            if global_server_args_dict["npu_enable_weight_nz"]:
+                self.weight.data = torch_npu.npu_format_cast(self.weight.contiguous(), 29)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -913,31 +793,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[str] = None,
     ):
-
-        # Special case for GGUF
-        # initialize GGUF param after we know the quantize type
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type and loaded_shard_id is not None:
-            idx_map = {"q": 0, "k": 1, "v": 2}
-            param.data[idx_map[loaded_shard_id]].copy_(loaded_weight)
-            param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
-            return
-
-        if is_gguf_weight:
-            output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
-
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-            param.shard_id.append(loaded_shard_id)
-            param.shard_id_map[loaded_shard_id] = len(param.data_container)
-            param.data_container.append(loaded_weight)
-            if len(param.data_container) == 3:
-                self.qweight = param.materialize_nested()
-            return
-
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
@@ -1099,6 +954,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if __is_npu__:
+            if global_server_args_dict["npu_enable_weight_nz"]:
+                self.weight.data = torch_npu.npu_format_cast(self.weight.contiguous(), 29)
+
 
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
@@ -1171,11 +1031,6 @@ class RowParallelLinear(LinearBase):
                 else self.weight_loader
             ),
         )
-        if not reduce_results and (bias and not skip_bias_add):
-            raise ValueError(
-                "When not reduce the results, adding bias to the "
-                "results can lead to incorrect results"
-            )
 
         if bias:
             self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
@@ -1192,19 +1047,6 @@ class RowParallelLinear(LinearBase):
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-
-        # Special case for GGUF
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type:
-            param.weight_type = loaded_weight.item()
-
-        # Materialize GGUF UninitializedParameter
-        if is_gguf_weight and isinstance(param, UninitializedParameter):
-            weight_shape = list(loaded_weight.shape)
-            if input_dim:
-                weight_shape[input_dim] = weight_shape[input_dim] // self.tp_size
-            param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
 
         param_data = param.data
         # bitsandbytes loads the weights of the specific portion
@@ -1223,7 +1065,7 @@ class RowParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param_data.shape == loaded_weight.shape
+        assert param_data.shape == loaded_weight.shape, f"{param_data.shape=} {loaded_weight.shape=}"
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
@@ -1234,7 +1076,7 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        if isinstance(param, BasevLLMParameter):
+        if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
             param.load_row_parallel_weight(
@@ -1247,7 +1089,30 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if __is_npu__:
+            use_mc2 = global_server_args_dict["npu_enable_mc2"] and __is_npu__ and isinstance(self.quant_method, UnquantizedLinearMethod) and self.reduce_results and self.tp_size > 1
+            if use_mc2:
+                self.weight.data = self.weight.T.contiguous()
+            if global_server_args_dict["npu_enable_weight_nz"]:
+                self.weight.data = torch_npu.npu_format_cast(self.weight.contiguous(), 29)
+
+    def npu_forward_mc2(self, input, bias):
+        mc2_group = get_tp_group().device_group
+        hcom_info = mc2_group._get_backend(torch.device("npu")).get_hccl_comm_name(torch.distributed.get_rank(mc2_group))
+        output = torch_npu.npu_mm_all_reduce_base(x1=input,
+                                                      x2=self.weight,
+                                                      hcom=hcom_info,
+                                                      reduce_op="sum",
+                                                      bias=bias,
+                                                      #antiquant_scale=antiquant_scale,
+                                                      #antiquant_offset=antiquant_offset,
+                                                      #x3=x3,
+                                                      #dequant_scale=dequant_scale
+                                                      )
+        return output
+
+    def forward(self, input_, scale = None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1261,11 +1126,19 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
-        if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+        use_mc2 = global_server_args_dict["npu_enable_mc2"] and __is_npu__ and isinstance(self.quant_method, UnquantizedLinearMethod) and self.reduce_results and self.tp_size > 1
+        if use_mc2:
+            output = self.npu_forward_mc2(input_parallel, bias_)
         else:
-            output = output_parallel
+            if scale is not None:
+                # TODO: dtype
+                output_parallel = self.quant_method.apply(self, input_parallel, bias_, scale, torch.bfloat16)
+            else:
+                output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if self.reduce_results and self.tp_size > 1:
+                output = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output = output_parallel
 
         output_bias = self.bias if self.skip_bias_add else None
 

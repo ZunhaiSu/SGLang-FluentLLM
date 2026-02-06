@@ -72,6 +72,9 @@ class BaseGrammarBackend:
         with self.cache_lock:
             self.cache.clear()
 
+    def reset_vocab_masks(self, vocab_masks: "torch.Tensor"):  # type: ignore
+        raise NotImplementedError()
+
 
 def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
     if server_args.grammar_backend == "outlines":

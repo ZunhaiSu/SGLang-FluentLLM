@@ -14,7 +14,7 @@
 """Constrained decoding with outlines backend."""
 
 import json
-import logging
+from sglang.srt.utils import get_colorful_logger
 from typing import Dict, List, Optional, Tuple, Union
 
 import interegular
@@ -35,7 +35,7 @@ except ImportError:
     from outlines_core.fsm.json_schema import build_regex_from_schema
 
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 class OutlinesGrammar(BaseGrammarObject):

@@ -1,15 +1,23 @@
-from sglang.srt.configs.chatglm import ChatGLMConfig
-from sglang.srt.configs.dbrx import DbrxConfig
-from sglang.srt.configs.exaone import ExaoneConfig
-from sglang.srt.configs.qwen2_5_vl_config import (
-    Qwen2_5_VLConfig,
-    Qwen2_5_VLVisionConfig,
-)
+from sglang.srt.configs.configuration_shortcut import ShortcutConfig
+from sglang.srt.configs.configuration_qwen3_moe import Qwen3MoeConfig
+from sglang.srt.configs.configuration_flash import FLASHConfig
+from sglang.srt.configs.configuration_qwen3 import Qwen3Config
+from sglang.srt.configs.configuration_deepseek_mha_nsa import DeepseekMhaNsaConfig
+from sglang.srt.configs.configuration_glm4_moe import Glm4MoeConfig
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
+
 
 __all__ = [
     "ExaoneConfig",
     "ChatGLMConfig",
     "DbrxConfig",
-    "Qwen2_5_VLConfig",
-    "Qwen2_5_VLVisionConfig",
+    "ShortcutConfig",
+    "Qwen3MoeConfig",
+    "FLASHConfig",
+    "Glm4MoeConfig",
+    "Qwen3Config",
+    "DeepseekMhaNsaConfig",
+    "Qwen3NextConfig",
+    "KimiLinearConfig"
 ]

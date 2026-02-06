@@ -11,7 +11,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     w8a8_block_fp8_matmul as vllm_w8a8_block_fp8_matmul,
 )
 
-from sglang.srt.layers.quantization.fp8_kernel import w8a8_block_fp8_matmul
+from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import w8a8_block_fp8_matmul
 
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

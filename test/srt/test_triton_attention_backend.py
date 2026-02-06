@@ -6,7 +6,7 @@ python3 -m unittest test_triton_attention_backend.TestTritonAttnBackend.test_mml
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import kill_process_tree, maybe_model_redirect
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 class TestTritonAttnBackend(unittest.TestCase):
     def test_latency(self):
         output_throughput = run_bench_one_batch(
-            DEFAULT_MODEL_NAME_FOR_TEST,
+            maybe_model_redirect(DEFAULT_MODEL_NAME_FOR_TEST),
             [
                 "--attention-backend",
                 "triton",
@@ -33,7 +33,7 @@ class TestTritonAttnBackend(unittest.TestCase):
             self.assertGreater(output_throughput, 153)
 
     def test_mmlu(self):
-        model = DEFAULT_MODEL_NAME_FOR_TEST
+        model = maybe_model_redirect(DEFAULT_MODEL_NAME_FOR_TEST)
         base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(
             model,

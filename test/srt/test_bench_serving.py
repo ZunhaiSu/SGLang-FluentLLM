@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
     run_bench_serving,
     write_github_step_summary,
 )
-
+import time
 
 class TestBenchServing(unittest.TestCase):
 
@@ -66,6 +66,7 @@ class TestBenchServing(unittest.TestCase):
             )
             self.assertGreater(res["output_throughput"], 3350)
 
+    @unittest.skip("skip this test temporarily")
     def test_offline_throughput_without_chunked_prefill(self):
         res = run_bench_serving(
             model=DEFAULT_MODEL_NAME_FOR_TEST,

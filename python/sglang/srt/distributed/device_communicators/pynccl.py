@@ -1,6 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
-import logging
+from sglang.srt.utils import get_colorful_logger
 from contextlib import contextmanager
 from typing import Optional, Union
 
@@ -20,7 +20,7 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
 )
 from sglang.srt.distributed.utils import StatelessProcessGroup
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 class PyNcclCommunicator:
@@ -75,7 +75,7 @@ class PyNcclCommunicator:
         self.available = True
         self.disabled = False
 
-        logger.info("sglang is using nccl==%s", self.nccl.ncclGetVersion())
+        logger.info("Epsilon is using nccl==%s", self.nccl.ncclGetVersion())
 
         if self.rank == 0:
             # get the unique id from NCCL

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import dataclasses
-import logging
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.utils import get_colorful_logger
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 if TYPE_CHECKING:
@@ -43,6 +44,7 @@ class SamplingBatchInfo:
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
     linear_penalty: torch.Tensor = None
+    multiply_penalty: torch.Tensor = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -52,6 +54,11 @@ class SamplingBatchInfo:
     custom_logit_processor: Optional[
         Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
     ] = None
+
+    # Use thinking_budget to truncate thinking
+    thinking_budgets: Optional[torch.Tensor] = None
+    think_end_ids: Optional[torch.Tensor] = None
+    last_token_ids: Optional[torch.Tensor] = None
 
     # Device
     device: str = "cuda"
@@ -77,6 +84,28 @@ class SamplingBatchInfo:
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
+
+        if any(hasattr(r.tokenizer, "think_end_id") for r in reqs):
+            thinking_budgets = torch.tensor(
+                [
+                    len(r.origin_input_ids)
+                    + (
+                        r.sampling_params.thinking_budget
+                        or r.sampling_params.max_new_tokens
+                    )
+                    for r in reqs
+                ],
+                dtype=torch.int32,
+            ).to(device, non_blocking=True)
+            think_end_ids = torch.tensor(
+                [[getattr(r.tokenizer, "think_end_id", -1)] for r in reqs],
+                 dtype=torch.int32,
+            ).to(device, non_blocking=True)
+            last_token_ids = torch.full_like(think_end_ids, -1)
+        else:
+            thinking_budgets = None
+            think_end_ids = None
+            last_token_ids = None
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
@@ -125,6 +154,7 @@ class SamplingBatchInfo:
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
                 penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedRepetitionPenalizer
             },
         )
 
@@ -133,6 +163,9 @@ class SamplingBatchInfo:
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
+            thinking_budgets=thinking_budgets,
+            think_end_ids=think_end_ids,
+            last_token_ids=last_token_ids,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             vocab_size=vocab_size,
@@ -168,27 +201,68 @@ class SamplingBatchInfo:
 
         # Apply the mask
         for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished:
+            if grammar and not grammar.finished and not grammar.is_terminated():
                 grammar.fill_vocab_mask(self.vocab_mask, i)
 
         # Move the mask to the device if needed
         self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
 
     def update_penalties(self):
+        # TODO: supported penalty in spec decoding
         if self.penalizer_orchestrator.is_required:
             self.linear_penalty = torch.zeros(
                 (len(self.temperatures), self.vocab_size),
                 dtype=torch.float32,
                 device=self.temperatures.device,
             )
+            # NOTE: This is specialized for repetition penalty, since it's not a
+            # linear verison penalty. I don't why we still need this, but add a
+            # multiply version in case of more options in the future.
+            self.multiply_penalty = torch.ones(
+                (len(self.temperatures), self.vocab_size),
+                dtype=torch.float32,
+                device=self.temperatures.device,
+            )
             self.penalizer_orchestrator.apply(self.linear_penalty)
+            for penalizer in self.penalizer_orchestrator.penalizers.values():
+                if isinstance(penalizer, penaltylib.BatchedRepetitionPenalizer):
+                    penalizer._update_multiply_penalty(self.multiply_penalty)
         else:
             self.linear_penalty = None
+            self.multiply_penalty = None
+
+    def apply_thinking_budgets(
+        self, seq_lens: torch.Tensor, next_token_ids: torch.Tensor
+    ):
+        diff_lens = seq_lens - self.thinking_budgets
+        bs, think_end_size = self.think_end_ids.size()
+        torch.where(
+            (self.thinking_budgets > 0)
+            & (diff_lens >= 0)
+            & (diff_lens < think_end_size),
+            self.think_end_ids[
+                torch.arange(bs), diff_lens.clamp(min=0, max=think_end_size - 1)
+            ],
+            next_token_ids,
+            out=next_token_ids,
+        )
+
+        self.last_token_ids[:] = torch.cat(
+            [self.last_token_ids[:, 1:], next_token_ids.unsqueeze(1)], dim=1
+        )
+        end_rows = (self.last_token_ids == self.think_end_ids).all(dim=1)
+        self.thinking_budgets[(self.thinking_budgets > 0) & end_rows] = -1
+
+        return next_token_ids
 
     def apply_logits_bias(self, logits: torch.Tensor):
         if self.linear_penalty is not None:
             # Used in the overlap mode
             logits.add_(self.linear_penalty)
+        
+        if self.multiply_penalty is not None:
+            # Used in the overlap mode
+            apply_scaling_penalties(logits, self.multiply_penalty)
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
@@ -198,19 +272,25 @@ class SamplingBatchInfo:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
-        self.penalizer_orchestrator.filter(keep_indices_device)
-
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
+
+        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
+            # Used in the non-overlap mode
+            self.penalizer_orchestrator.filter(keep_indices_device)
 
         for item in [
             "temperatures",
             "top_ps",
             "top_ks",
             "min_ps",
+            "thinking_budgets",
+            "think_end_ids",
+            "last_token_ids",
         ]:
             value = getattr(self, item, None)
-            setattr(self, item, value[keep_indices_device])
+            if value is not None:
+                setattr(self, item, value[keep_indices_device])
 
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
@@ -303,10 +383,14 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "thinking_budgets",
+            "think_end_ids",
+            "last_token_ids",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
-            setattr(self, item, torch.concat([self_val, other_val]))
+            if self_val is not None and other_val is not None:
+                setattr(self, item, torch.concat([self_val, other_val]))
 
         self.is_all_greedy |= other.is_all_greedy
         self.need_min_p_sampling |= other.need_min_p_sampling

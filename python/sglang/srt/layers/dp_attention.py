@@ -13,6 +13,16 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.custom_all_reduce import _can_p2p
+from sglang.srt.utils import get_colorful_logger, is_npu, is_sm90_supported
+if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsMetadata
+logger = get_colorful_logger(__name__)
+
+_is_npu__ = is_npu()
+
+if not _is_npu__:
+    import eps
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -23,34 +33,85 @@ _ATTN_TP_SIZE = None
 _DP_RANK = None
 _DP_SIZE = None
 
+_ATTN_TP_DP_CONVERTOR = None
+_DENSE_TP_DP_CONVERTOR = None
 
-def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
-    if not enable_dp_attention:
-        return tp_rank, tp_size, 0
+"""
+============================================= initialize dp tp convertor =============================================
 
-    attn_tp_size = tp_size // dp_size
-    dp_rank = tp_rank // attn_tp_size
-    attn_tp_rank = tp_rank % attn_tp_size
-    return attn_tp_rank, attn_tp_size, dp_rank
+|============|================|==============================|======================|
+| ATTN DP TP |   POST ATTN    |          PRE DENSE           |     DENSE DP TP      |
+|============|================|==============================|======================|
+|            |                | all gather in dense dp group |       DP1 TP8        |
+|            |                |==============================|======================|
+|  DP8 TP1   |   No comm      | all gather in dense dp group |   DP2 TP4 | DP4 TP2  |
+|            |                |==============================|======================|
+|            |                |          No comm              |       DP8 TP1        |
+|============|================|==============================|======================|
+|  DP2 TP4   | reduce_scatter | all gather in dense dp group |       DP2 TP4        |
+|============|================|==============================|======================|
+|  DP4 TP2   | reduce_scatter | all gather in dense dp group |       DP4 TP2        |
+|============|================|==============================|======================|
+|  DP1 TP8   | reduce_scatter |          No comm              |       DP8 TP1        |
+|============|================|==============================|======================|
+
+"""
+"""
+    Communication module in eps, used for uneven reduce_scatter and all_gather within attn tp group
+"""
+def init_attn_tp_dp_convertor_v1(global_rank, max_num_tokens, attn_tp_size, hidden_size):
+    global _ATTN_TP_DP_CONVERTOR
+    from sglang.srt.distributed.parallel_state import _EPS_COMMUNICATOR
+    from eps.communication import TPDPConvertor
+    p = TPDPConvertor.Params(
+        global_rank,
+        max_num_tokens,
+        attn_tp_size,
+        hidden_size,
+        _EPS_COMMUNICATOR,
+    )
+    convertor = TPDPConvertor(p)
+    _ATTN_TP_DP_CONVERTOR = convertor
+
+"""
+    Custom triton multimem communication module, used for uneven reduce_scatter and all_gather within tp group
+    eps establishes global communication groups, but for completing reduce_scatter and all_gather within tp group, here we only establish in-group communication connections
+"""
+def init_attn_tp_dp_convertor_v2(max_num_tokens, hidden_size):
+    
+    global _ATTN_TP_DP_CONVERTOR
+    from sglang.srt.distributed.device_communicators.custom_triton_rsag.triton_rsag import TritonRSAG
+    convertor = TritonRSAG(get_attention_tp_group(), get_attention_tp_rank(), max_num_tokens, hidden_size)
+    _ATTN_TP_DP_CONVERTOR = convertor
 
 
-def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size):
+def init_dense_tp_dp_convertor(max_num_tokens, hidden_size):
+    global _DENSE_TP_DP_CONVERTOR
+    from sglang.srt.distributed.device_communicators.custom_triton_rsag.triton_rsag import TritonRSAG
+    convertor = TritonRSAG(get_dense_tp_group(), get_dense_tp_rank(), max_num_tokens, hidden_size)
+    _DENSE_TP_DP_CONVERTOR = convertor
+
+"""
+============================================= initialize dp tp group =============================================
+"""
+def initialize_dp_attention(attn_tp_rank, attn_tp_size, dp_size, dp_rank, global_rank, local_rank, hidden_size, max_num_tokens, force_deterministic_rsag):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK, _DP_SIZE
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
-    _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK = compute_dp_attention_world_info(
-        enable_dp_attention, tp_rank, tp_size, dp_size
-    )
+    _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK = attn_tp_rank, attn_tp_size, dp_rank
     _DP_SIZE = dp_size
 
     tp_group = get_tp_group()
+
+    world_size = torch.distributed.get_world_size()
+
     _ATTN_TP_GROUP = GroupCoordinator(
         [
             list(range(head, head + _ATTN_TP_SIZE))
-            for head in range(0, tp_size, _ATTN_TP_SIZE)
+            for head in range(0, world_size, _ATTN_TP_SIZE)
         ],
-        tp_rank,
+        local_rank,
         torch.distributed.get_backend(tp_group.device_group),
         SYNC_TOKEN_IDS_ACROSS_TP,
         False,
@@ -59,6 +120,51 @@ def initialize_dp_attention(enable_dp_attention, tp_rank, tp_size, dp_size):
         False,
         group_name="attention_tp",
     )
+
+    assert max_num_tokens is not None
+
+    if not _is_npu__ and _can_p2p(local_rank, attn_tp_size):
+        if attn_tp_size > 1 and is_sm90_supported() and not force_deterministic_rsag:
+            init_attn_tp_dp_convertor_v2(max_num_tokens=max_num_tokens, hidden_size=hidden_size)
+        else:
+            init_attn_tp_dp_convertor_v1(global_rank=global_rank, max_num_tokens=max_num_tokens, attn_tp_size=attn_tp_size, hidden_size=hidden_size)
+
+
+def initialize_dp_dense(dense_tp_rank, dense_tp_size, dense_dp_size, dense_dp_rank, max_num_tokens, hidden_size, local_rank):
+    global _ATTN_TP_DP_CONVERTOR, _DENSE_TP_DP_CONVERTOR, _ATTN_TP_GROUP, _DP_SIZE, _ATTN_TP_SIZE, _DENSE_TP_GROUP, _DENSE_TP_RANK, _DENSE_TP_SIZE, _DENSE_DP_RANK, _DENSE_DP_SIZE
+
+    _DENSE_TP_RANK, _DENSE_TP_SIZE, _DENSE_DP_RANK, _DENSE_DP_SIZE = dense_tp_rank, dense_tp_size, dense_dp_rank, dense_dp_size
+
+    if _DENSE_TP_SIZE == _ATTN_TP_SIZE:
+        logger.info(f"dense_dp_tp_group reuse attn_dp_tp_group")
+        _DENSE_TP_GROUP = _ATTN_TP_GROUP
+        _DENSE_TP_DP_CONVERTOR = _ATTN_TP_DP_CONVERTOR
+    else:
+        dense_tp_groups = []
+        for i in range(_DENSE_DP_SIZE):
+            dense_tp_group_ranks = list(range(i * _DENSE_TP_SIZE, (i + 1) * _DENSE_TP_SIZE))
+            logger.info(f"dense_tp_group_ranks: {dense_tp_group_ranks}")
+            dense_tp_groups.append(torch.distributed.new_group(dense_tp_group_ranks))
+        _DENSE_TP_GROUP = dense_tp_groups
+
+        assert max_num_tokens is not None
+
+        if not _is_npu__ and _can_p2p(local_rank, dense_tp_size):
+            init_dense_tp_dp_convertor(
+                max_num_tokens=max_num_tokens * max(int(_DP_SIZE / _DENSE_DP_SIZE), 1),
+                hidden_size=hidden_size
+            )
+
+"""
+============================================= get dp tp convertor && info =============================================
+"""
+def get_dense_tp_dp_convertor():
+    return _DENSE_TP_DP_CONVERTOR
+
+
+def get_attn_tp_dp_convertor():
+    assert _ATTN_TP_DP_CONVERTOR is not None, "attn_tp_dp_convertor is not initialized!"
+    return _ATTN_TP_DP_CONVERTOR
 
 
 def get_attention_tp_group():
@@ -86,7 +192,44 @@ def get_attention_dp_size():
     return _DP_SIZE
 
 
-def get_dp_local_info(forward_batch: ForwardBatch):
+def get_dense_tp_group():
+    assert _DENSE_TP_GROUP is not None, "dp dense not initialized!"
+    if isinstance(_DENSE_TP_GROUP, list):
+        return _DENSE_TP_GROUP[_DENSE_DP_RANK]
+    else:
+        return _DENSE_TP_GROUP
+
+
+def get_dense_tp_rank():
+    assert _DENSE_TP_RANK is not None, "dp dense not initialized!"
+    return _DENSE_TP_RANK
+
+
+def get_dense_tp_size():
+    assert _DENSE_TP_SIZE is not None, "dp dense not initialized!"
+    return _DENSE_TP_SIZE
+
+
+def get_dense_dp_rank():
+    assert _DENSE_DP_RANK is not None, "dp dense not initialized!"
+    return _DENSE_DP_RANK
+
+
+def get_dense_dp_size():
+    assert _DENSE_DP_SIZE is not None, "dp dense not initialized!"
+    return _DENSE_DP_SIZE
+
+
+def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):
+    if not enable_dp_attention:
+        return tp_rank, tp_size, 0
+
+    attn_tp_size = tp_size // dp_size
+    dp_rank = tp_rank // attn_tp_size
+    attn_tp_rank = tp_rank % attn_tp_size
+    return attn_tp_rank, attn_tp_size, dp_rank
+
+def get_dp_local_info(forward_batch: LogitsMetadata):
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
@@ -144,6 +287,31 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
+def memcpy_npu(dst, src, dim, offset, sz, offset_src):
+    """
+    NPU-compatible memcpy_triton alternative implementation.
+    dst: Destination tensor
+    src: Source tensor
+    dim: Currently only supports 0
+    offset: Starting position for writing to destination tensor
+    sz: Number of elements to copy (main dimension)
+    offset_src: Whether to offset src (True means src[offset:offset+sz], False means src[:sz])
+    """
+    assert dim == 0, "Only supports dimension 0"
+    assert src.shape[1:] == dst.shape[1:], "src and dst must have the same shape except for the main dimension"
+    if offset_src:
+        # src offset
+        dst[:sz].copy_(src[offset:offset+sz])
+    else:
+        # dst offset
+        dst[offset:offset+sz].copy_(src[:sz])
+
+def memcpy_generic(dst, src, dim, offset, sz, offset_src):
+    if _is_npu:
+        memcpy_npu(dst, src, dim, offset, sz, offset_src)
+    else:
+        memcpy_triton(dst, src, dim, offset, sz, offset_src)
+
 def dp_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -161,7 +329,7 @@ def dp_gather(
         assert (
             global_tokens.storage().data_ptr() != local_tokens.storage().data_ptr()
         ), "aliasing between global_tokens and local_tokens not allowed"
-        memcpy_triton(
+        memcpy_generic(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
 
@@ -194,7 +362,7 @@ def dp_scatter(
             local_tokens.untyped_storage().data_ptr()
             != global_tokens.untyped_storage().data_ptr()
         ), "aliasing between local_tokens and global_tokens not allowed"
-        memcpy_triton(
+        memcpy_generic(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
 

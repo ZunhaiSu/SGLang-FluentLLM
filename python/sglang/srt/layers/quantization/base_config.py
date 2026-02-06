@@ -2,7 +2,7 @@
 
 import inspect
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type
 
 import torch
 from torch import nn
@@ -99,20 +99,20 @@ class QuantizationConfig(ABC):
         except ValueError:
             return default
 
-    @abstractmethod
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[QuantizeMethodBase]:
-        """Get the quantize method to use for the quantized layer.
+    # @abstractmethod
+    # def get_quant_method(
+    #     self, layer: torch.nn.Module, prefix: str
+    # ) -> Optional[QuantizeMethodBase]:
+    #     """Get the quantize method to use for the quantized layer.
 
-        Args:
-            layer: The layer for the quant method.
-            prefix: The full name of the layer in the state dict
-        Returns:
-            The quantize method. None if the given layer doesn't support quant
-            method.
-        """
-        raise NotImplementedError
+    #     Args:
+    #         layer: The layer for the quant method.
+    #         prefix: The full name of the layer in the state dict
+    #     Returns:
+    #         The quantize method. None if the given layer doesn't support quant
+    #         method.
+    #     """
+    #     raise NotImplementedError
 
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:
@@ -120,6 +120,84 @@ class QuantizationConfig(ABC):
 
         For now, this is only used by AWQ.
         """
+        raise NotImplementedError
+
+
+class LinearMethodBase(QuantizeMethodBase):
+    """Base class for different (maybe quantized) linear methods."""
+
+    @abstractmethod
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """Create weights for a linear layer.
+           The weights will be set as attributes of the layer.
+
+        Args:
+            layer: The layer that is using the LinearMethodBase factory.
+            input_size_per_partition: Size of the weight input dim on rank X.
+            output_partition_sizes: Sizes of the output dim of each logical
+                weight on rank X. E.g., output_partition_sizes for QKVLinear
+                is a list contains the width of Wq, Wk, Wv on rank X.
+            input_size: Size of the input dim of the weight across all ranks.
+            output_size: Size of the output dim of the weight across all ranks.
+            params_dtype: Datatype of the parameters.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply the weights in layer to the input tensor.
+        Expects create_weights to have been called before on the layer."""
+        raise NotImplementedError
+
+
+class FusedMoEMethodBase(QuantizeMethodBase):
+
+    @abstractmethod
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        inplace: bool = False,
+        no_combine: bool = False,
+    ) -> torch.Tensor:
         raise NotImplementedError
 
 

@@ -20,7 +20,7 @@ from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import is_port_available
+from sglang.srt.utils import is_port_available, maybe_model_redirect
 from sglang.test.runners import (
     HFRunner,
     SRTRunner,
@@ -147,6 +147,7 @@ def _run_subprocess(
     decode_tolerance: float,
 ):
     try:
+        model_path = maybe_model_redirect(model_path)
         print(f"subprocess[{tp_rank=}] Start {os.environ.get('CUDA_VISIBLE_DEVICES')=}")
 
         os.environ["MASTER_ADDR"] = "localhost"

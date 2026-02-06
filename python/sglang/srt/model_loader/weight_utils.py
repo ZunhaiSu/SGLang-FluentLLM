@@ -5,7 +5,7 @@ import fnmatch
 import glob
 import hashlib
 import json
-import logging
+from sglang.srt.utils import get_colorful_logger
 import os
 import tempfile
 from collections import defaultdict
@@ -22,7 +22,6 @@ from typing import (
 )
 
 import filelock
-import gguf
 import huggingface_hub.constants
 import numpy as np
 import safetensors.torch
@@ -34,10 +33,11 @@ from tqdm.auto import tqdm
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.utils import print_warning_once
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
@@ -133,10 +133,6 @@ def get_quant_config(
     model_config: ModelConfig, load_config: LoadConfig
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
-
-    # GGUF doesn't have config file
-    if model_config.quantization == "gguf":
-        return quant_cls.from_config({})
 
     # Read the quantization config from the HF model config, if available.
     hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -461,48 +457,6 @@ def pt_weights_iterator(
         torch.cuda.empty_cache()
 
 
-def get_gguf_extra_tensor_names(
-    gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
-) -> List[str]:
-    reader = gguf.GGUFReader(gguf_file)
-    expected_gguf_keys = set(gguf_to_hf_name_map.keys())
-    exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
-    extra_keys = expected_gguf_keys - exact_gguf_keys
-    return [gguf_to_hf_name_map[key] for key in extra_keys]
-
-
-def gguf_quant_weights_iterator(
-    gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """
-    Iterate over the quant weights in the model gguf files and convert
-    them to torch tensors
-    """
-
-    reader = gguf.GGUFReader(gguf_file)
-
-    for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
-
-            if weight_type.name != "F32":
-                weight_type_name = name.replace("weight", "qweight_type")
-                weight_type = torch.tensor(weight_type)
-                yield weight_type_name, weight_type
-
-    for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight = tensor.data
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
-
-            if weight_type.name != "F32":
-                name = name.replace("weight", "qweight")
-            param = torch.tensor(weight)
-            yield name, param
-
-
 def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     """convert PySafeSlice object from safetensors to torch.Tensor
 
@@ -561,7 +515,7 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_attention_tp_rank()
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
@@ -799,3 +753,40 @@ def kv_cache_scales_loader(
         tp_rank,
     )
     return []
+
+
+def narrow_padded_param_and_loaded_weight(
+    param_data,
+    loaded_weight,
+    param_data_start,
+    weight_start,
+    dim,
+    shard_size,
+    narrow_weight=True,
+):
+    actual_shard_size = get_actual_shard_size(
+        shard_size, weight_start, loaded_weight.size(dim)
+    )
+
+    if narrow_weight:
+        if actual_shard_size > 0:
+            loaded_weight = loaded_weight.narrow(dim, weight_start, actual_shard_size)
+        else:
+            # No real data to load; create a dummy tensor filled with zeros
+            loaded_weight = torch.zeros_like(
+                param_data.narrow(dim, param_data_start, actual_shard_size)
+            )
+
+    # [Note] Reset padded weights to zero.
+    # If the actual shard size is less than the shard size, we need to reset
+    # the padded param_data to zero and then copy the loaded_weight into it.
+    reset_param_data_if_needed(
+        param_data,
+        dim,
+        param_data_start + actual_shard_size,
+        shard_size - actual_shard_size,
+    )
+
+    param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
+
+    return param_data, loaded_weight

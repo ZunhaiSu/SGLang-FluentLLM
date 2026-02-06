@@ -1,13 +1,12 @@
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/parameter.py"""
 
-import logging
+from sglang.srt.utils import get_colorful_logger
 from fractions import Fraction
 from typing import Callable, Optional, Union
 
 import torch
 from torch.nn import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 __all__ = [
     "BasevLLMParameter",
@@ -20,7 +19,7 @@ __all__ = [
     "RowvLLMParameter",
 ]
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 class BasevLLMParameter(Parameter):
@@ -100,7 +99,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
-    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
+    def load_merged_column_weight(self, loaded_weight: torch.Tensor, tp_rank: int, **kwargs):
 
         shard_offset = kwargs.get("shard_offset")
         shard_size = kwargs.get("shard_size")
@@ -114,8 +113,6 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             )
 
         param_data = self.data
-
-        tp_rank = get_tensor_model_parallel_rank()
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
         if not use_presharded_weights:
             loaded_weight = loaded_weight.narrow(
@@ -447,3 +444,12 @@ def _adjust_shard_indexes_for_packing(
             marlin_tile_size=marlin_tile_size,
         )
     return shard_size, shard_offset
+
+
+class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):
+    """
+    Parameter class for weight scales loaded for weights with
+    block-wise quantization. Uses both column and row parallelism.
+    """
+
+    pass

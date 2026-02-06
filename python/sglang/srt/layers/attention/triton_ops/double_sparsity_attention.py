@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.env import global_server_args_dict
 from sglang.srt.utils import is_hip
 
 is_cuda_available = torch.cuda.is_available()

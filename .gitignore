@@ -226,4 +226,18 @@ compile_commands.json
 # VSCode
 .vscode
 
-1
+.mignore
+press.py
+*.parquet
+data/
+tmp/
+.specify/
+specs/
+expert_distribution/
+*.jsonl
+benchmark_results/
+benchmars_results/
+*.whl 
+debug/
+memory/
+logs/

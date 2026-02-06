@@ -26,7 +26,7 @@ import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
-from sglang.srt.utils import init_custom_process_group
+from sglang.srt.utils import init_custom_process_group, maybe_model_redirect
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -356,6 +356,7 @@ def test_update_weights_from_distributed(
     truncate_size,
     checking_parameters,
 ):
+    model_name = maybe_model_redirect(model_name)
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
     )
@@ -558,6 +559,7 @@ class TestUpdateWeightsFromDistributed(unittest.TestCase):
         test_models = [test_suit[2] for test_suit in test_suits]
 
         for model_name in test_models:
+            model_name = maybe_model_redirect(model_name)
             model = AutoModelForCausalLM.from_pretrained(
                 model_name, torch_dtype="bfloat16"
             ).to("cuda:0")
@@ -587,6 +589,7 @@ class TestUpdateWeightsFromDistributed(unittest.TestCase):
         ]
 
         for tp_size, dp_size, model_name, backend in test_suits:
+            model_name = maybe_model_redirect(model_name)
             test_update_weights_from_distributed(
                 tp_size,
                 dp_size,

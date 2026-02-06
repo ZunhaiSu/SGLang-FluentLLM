@@ -26,11 +26,11 @@ from tqdm import tqdm
 
 mp.set_start_method("spawn", force=True)
 
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import (
     _w8a8_block_fp8_matmul,
     _w8a8_block_fp8_matmul_unrolledx4,
 )
-from sglang.srt.layers.quantization.int8_kernel import _w8a8_block_int8_matmul
+from sglang.srt.layers.dense.gemms.int8.int8_kernel import _w8a8_block_int8_matmul
 from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
 
 is_hip_ = is_hip()

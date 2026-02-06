@@ -7,10 +7,11 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.allocator import KVAllocator
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.req import Req
 
 
 class ChunkCacheEntry:
@@ -21,19 +22,21 @@ class ChunkCacheEntry:
 
 class ChunkCache(BasePrefixCache):
     def __init__(
-        self, req_to_token_pool: ReqToTokenPool, token_to_kv_pool: BaseTokenToKVPool
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        kv_allocator: KVAllocator,
     ):
         self.disable = True
         self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool = token_to_kv_pool
+        self.kv_allocator = kv_allocator
         self.entries: Dict[str, ChunkCacheEntry] = {}
-
         self.reset()
 
     def reset(self):
         self.entries = {}
+        self.draft_entries = {}
 
-    def match_prefix(self, rid: int, key: List[int]) -> Tuple[List[int], int]:
+    def match_prefix(self, rid: str, key: List[int]) -> Tuple[List[int], ChunkCacheEntry]:
         if rid not in self.entries:
             return [], None
 
@@ -41,9 +44,18 @@ class ChunkCache(BasePrefixCache):
         max_prefix_len = len(key)
         return entry.value[:max_prefix_len], entry
 
+    def match_prefix_draft(self, rid: str, key: List[int]) -> Tuple[List[int], ChunkCacheEntry]:
+        if rid not in self.entries:
+            return [], None
+
+        entry = self.draft_entries[rid]
+        max_prefix_len = len(key)
+        return entry.value[:max_prefix_len], entry
+
     def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         if token_ids is None:
-            token_id_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
+            token_id_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         else:
             token_id_len = len(token_ids)
 
@@ -51,7 +63,7 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, :token_id_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.token_to_kv_pool.free(kv_indices)
+        self.kv_allocator.free(req.req_pool_idx, kv_indices)
 
         if req.rid in self.entries:
             del self.entries[req.rid]
@@ -70,6 +82,8 @@ class ChunkCache(BasePrefixCache):
         entry.value = kv_indices
         req.prefix_indices = kv_indices
         req.last_node = entry
+        req.pages_info = self.kv_allocator.get_pages_info(req.req_pool_idx)
+        req.req_to_token_pool_info = self.req_to_token_pool.get_req_pool_info(req.req_pool_idx)
 
     def insert(self):
         raise NotImplementedError()

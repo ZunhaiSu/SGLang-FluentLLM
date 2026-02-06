@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import openai
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import kill_process_tree, maybe_model_redirect
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -20,8 +20,8 @@ from sglang.test.test_utils import (
 )
 
 
-def setup_class(cls, backend: str, disable_overlap: bool):
-    cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+def setup_class(cls, backend: str, disable_overlap: bool = False):
+    cls.model = maybe_model_redirect(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
     cls.base_url = DEFAULT_URL_FOR_TEST
     cls.json_schema = json.dumps(
         {
@@ -36,6 +36,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
     )
 
     other_args = [
+        "--disable-radix-cache",
         "--max-running-requests",
         "10",
         "--grammar-backend",
@@ -53,10 +54,10 @@ def setup_class(cls, backend: str, disable_overlap: bool):
     )
 
 
-class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
+class TestJSONConstrainedXGrammarBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, backend="outlines", disable_overlap=False)
+        setup_class(cls, backend="xgrammar", disable_overlap=False)
 
     @classmethod
     def tearDownClass(cls):
@@ -131,6 +132,13 @@ class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
 
         with ThreadPoolExecutor(len(json_schemas)) as executor:
             list(executor.map(self.run_decode, json_schemas))
+
+
+@unittest.skip("Not supported for now")
+class TestJSONConstrainedOutlinesBackend(TestJSONConstrainedXGrammarBackend):
+    @classmethod
+    def setUpClass(cls):
+        setup_class(cls, backend="outlines")
 
 
 if __name__ == "__main__":

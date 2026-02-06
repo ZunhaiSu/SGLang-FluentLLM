@@ -18,27 +18,26 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm import _custom_ops as ops
 
+from sglang.srt.layers.moe.layouts.mapping import make_expert_params_mapping
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_utils import (
-    block_quant_to_tensor_quant,
-    normalize_e4m3fn_to_e4m3fnuz,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.env import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.utils import is_hip
+from sglang.srt.layers.dense.gemms.fp8.fp8_utils import block_dequant
+from sglang.srt.layers.utils import (
+    FLLM_IS_CP, CP_METADATA, cp_split_and_rebuild_data, cp_all_gather_rerange_output
+)
 
 is_hip_ = is_hip()
 
@@ -63,8 +62,9 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
+        self.alt_stream = torch.cuda.Stream()
         self.decoder = DeepseekV2DecoderLayer(
-            config, 0, quant_config=quant_config, is_nextn=True
+            config, 0, quant_config=quant_config, is_nextn=True, alt_stream=self.alt_stream
         )
 
         self.shared_head = nn.Module()
@@ -93,12 +93,21 @@ class DeepseekModelNextN(nn.Module):
         )
 
         residual = None
+        tp_num_tokens = hidden_states.shape[0]
+        forward_batch.tp_num_tokens = tp_num_tokens
+        if CP_METADATA:
+            hidden_states = cp_split_and_rebuild_data(hidden_states, CP_METADATA.value.split_list, CP_METADATA.value.zigzag_index)
+            positions = cp_split_and_rebuild_data(positions, CP_METADATA.value.split_list, CP_METADATA.value.zigzag_index)
         hidden_states, residual = self.decoder(
-            positions, hidden_states, forward_batch, residual
+            positions, hidden_states, forward_batch, residual, tp_num_tokens=tp_num_tokens
         )
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            if not FLLM_IS_CP:
+                hidden_states, _ = self.decoder.decoder_comm_manager.post_final_norm_comm(hidden_states, residual, tp_num_tokens)
+        if CP_METADATA:
+            hidden_states = cp_all_gather_rerange_output(hidden_states, CP_METADATA.value, self.decoder.decoder_comm_manager.attn_rsag)
         return hidden_states
 
 
@@ -143,30 +152,27 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        if hasattr(self.config, "num_nextn_predict_layers"):
-            num_nextn_layers = self.config.num_nextn_predict_layers
-            assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"
-            assert num_nextn_layers == self.config.num_hidden_layers
-        else:
-            raise ValueError("num_nextn_predict_layers is not in the config")
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
+        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
+            self.config.q_lora_rank is not None
+        )
+        cached_a_proj = {} if fuse_qkv_a_proj else None
+
         # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
-        expert_params_mapping = MoEImpl.make_expert_params_mapping(
+        # (param_name, weight_name, local_expert_id, shard_id)
+        expert_params_mapping = make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
         )
 
-        nextn_layer_prefix = "model.layers.0"
         nextn_spec_weight_names = [
             "shared_head.norm",
             "eh_proj",
@@ -176,8 +182,24 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if not name.startswith(nextn_layer_prefix):
-                continue
+            if hasattr(self.config, "num_nextn_predict_layers"):
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"
+                nextn_layer_prefix = "model.layers.0"
+                if num_nextn_layers != self.config.num_hidden_layers:
+                    if name.startswith("model.layers"):
+                        name_list = name.split(".")
+                        if (
+                            len(name_list) >= 3
+                            and int(name_list[2]) >= self.config.num_hidden_layers
+                        ):
+                            nextn_layer_prefix = "model.layers." + str(name_list[2])
+                        else:
+                            continue
+                if not name.startswith(nextn_layer_prefix):
+                    continue
+            else:
+                raise ValueError("num_nextn_predict_layers is not in the config")
 
             # Use shared head and embed weights from target model
             if "shared_head.head" in name or "embed_tokens" in name:
@@ -217,81 +239,97 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
+                if ("mlp.experts." in name):
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, local_expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            shard_id=shard_id,
+                            local_expert_id=local_expert_id,
+                        )
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
 
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-
-        if not global_server_args_dict["disable_mla"]:
-            self_attn = self.model.decoder.self_attn
-            if hasattr(self_attn.kv_b_proj, "qweight"):
-                # AWQ compatible
-                w = ops.awq_dequantize(
-                    self_attn.kv_b_proj.qweight,
-                    self_attn.kv_b_proj.scales,
-                    self_attn.kv_b_proj.qzeros,
-                    0,
-                    0,
-                    0,
-                ).T
-            else:
-                w = self_attn.kv_b_proj.weight
-            # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-            # This may affect the accuracy of fp8 model.
-            if hasattr(self.quant_config, "weight_block_size") and w.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            ):
-                weight_block_size = self.quant_config.weight_block_size
-                if weight_block_size is not None:
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                    if is_hip_:
-                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                            weight=w,
-                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                            input_scale=None,
+                    if fuse_qkv_a_proj and (
+                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                    ):
+                        cached_a_proj[name] = loaded_weight
+                        q_a_proj_name = (
+                            name
+                            if "q_a_proj" in name
+                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
                         )
-                    else:
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                        kv_a_proj_name = (
+                            name
+                            if "kv_a_proj_with_mqa" in name
+                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                        )
 
-                    w, scale = block_quant_to_tensor_quant(
-                        weight, weight_scale, weight_block_size
-                    )
-                    self_attn.w_scale = scale
-            w_kc, w_vc = w.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-            if (
-                hasattr(self_attn.kv_b_proj, "weight_scale")
-                and self_attn.w_scale is None
-            ):
-                self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-                if is_hip_:
-                    self_attn.w_scale *= 2.0
+                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
+                        if (
+                            q_a_proj_name in cached_a_proj
+                            and kv_a_proj_name in cached_a_proj
+                        ):
+
+                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
+                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                            fused_weight = torch.cat(
+                                [q_a_proj_weight, kv_a_proj_weight], dim=0
+                            )
+
+                            if "q_a_proj" in name:
+                                param_name = name.replace(
+                                    "q_a_proj", "fused_qkv_a_proj_with_mqa"
+                                )
+                            else:
+                                param_name = name.replace(
+                                    "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
+                                )
+                            param = params_dict[param_name]
+
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, fused_weight)
+                            cached_a_proj.pop(q_a_proj_name)
+                            cached_a_proj.pop(kv_a_proj_name)
+                    else:
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        self_attn = self.model.decoder.self_attn
+        if hasattr(self.quant_config, "weight_block_size") and (self.quant_config.weight_block_size is not None) and self_attn.kv_b_proj.weight.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ):
+            weight_block_size = self.quant_config.weight_block_size
+            dtype = torch.get_default_dtype()
+            w = block_dequant(
+                self_attn.kv_b_proj.weight,
+                self_attn.kv_b_proj.weight_scale_inv,
+                weight_block_size
+            ).to(dtype)
+        else:
+            w = self_attn.kv_b_proj.weight
+
+        w_kc, w_vc = w.unflatten(
+            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+        ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+        self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+        self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

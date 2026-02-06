@@ -14,11 +14,10 @@
 """DetokenizerManager is a process that detokenizes the token ids."""
 
 import dataclasses
-import json
-import logging
+from sglang.srt.utils import get_colorful_logger, register_usr_signal
 import os
 import signal
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from typing import Dict, List, Union
 
 import psutil
@@ -44,7 +43,7 @@ from sglang.utils import (
     get_exception_traceback,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 # Maximum number of request states that detokenizer can hold. When exceeded,
 # oldest request states will be evicted. Default: 65536 (1<<16).
@@ -61,7 +60,8 @@ class DecodeStatus:
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
-
+    # Offset that's sent to tokenizer for incremental update.
+    sent_offset: int = 0
 
 class DetokenizerManager:
     """DetokenizerManager is a process that detokenizes the token ids."""
@@ -101,6 +101,10 @@ class DetokenizerManager:
             ]
         )
 
+    def maybe_clear_socket_mapping(self):
+        if hasattr(self, "socket_mapping"):
+            self.socket_mapping.clear_all_sockets()
+
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
@@ -135,6 +139,26 @@ class DetokenizerManager:
         # If it is embedding model, no detokenization is needed.
         return recv_obj
 
+    def decode_grouped_batch(self, ids, recv_obj):
+        groups = defaultdict(list)
+        for i, id in enumerate(ids):
+            key = (recv_obj.skip_special_tokens[i], recv_obj.spaces_between_special_tokens[i])
+            groups[key].append((i, id))
+
+        texts = [None] * len(ids)
+
+        for (skip, spaces), items in groups.items():
+            indices, ids = zip(*items)
+            decoded_batch = self.tokenizer.batch_decode(
+                ids,
+                skip_special_tokens=skip,
+                spaces_between_special_tokens=spaces,
+            )
+            for idx, text in zip(indices, decoded_batch):
+                texts[idx] = text
+
+        return texts
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOut):
         bs = len(recv_obj.rids)
 
@@ -152,7 +176,7 @@ class DetokenizerManager:
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
-                s.decode_ids = recv_obj.decode_ids[i]
+                s.decode_ids.extend(recv_obj.decode_ids[i])
 
             read_ids.append(
                 self.trim_matched_stop(
@@ -164,16 +188,21 @@ class DetokenizerManager:
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
         # TODO(lmzheng): handle skip_special_tokens/spaces_between_special_tokens per request
-        surr_texts = self.tokenizer.batch_decode(
-            surr_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
-            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-        )
-        read_texts = self.tokenizer.batch_decode(
-            read_ids,
-            skip_special_tokens=recv_obj.skip_special_tokens[0],
-            spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-        )
+        all_same = (len(set(recv_obj.skip_special_tokens)) <= 1) and (len(set(recv_obj.spaces_between_special_tokens)) <= 1)
+        if all_same:
+            surr_texts = self.tokenizer.batch_decode(
+                surr_ids,
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
+            read_texts = self.tokenizer.batch_decode(
+                read_ids,
+                skip_special_tokens=recv_obj.skip_special_tokens[0],
+                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
+            )
+        else:
+            surr_texts = self.decode_grouped_batch(surr_ids, recv_obj)
+            read_texts = self.decode_grouped_batch(read_ids, recv_obj)
 
         # Incremental decoding
         output_strs = []
@@ -200,18 +229,21 @@ class DetokenizerManager:
                 else:
                     new_text = find_printable_text(new_text)
 
-            output_strs.append(
-                self.trim_matched_stop(
-                    s.decoded_text + new_text,
-                    recv_obj.finished_reasons[i],
-                    recv_obj.no_stop_trim[i],
-                )
+            output_str = self.trim_matched_stop(
+                s.decoded_text + new_text,
+                recv_obj.finished_reasons[i],
+                recv_obj.no_stop_trim[i],
             )
+            # Incrementally send text.
+            incremental_output = output_str[s.sent_offset :]
+            s.sent_offset = len(output_str)
+            output_strs.append(incremental_output)
 
         return BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
+            output_ids=recv_obj.decode_ids,
             prompt_tokens=recv_obj.prompt_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
@@ -229,6 +261,9 @@ class DetokenizerManager:
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_hidden_states=recv_obj.output_hidden_states,
+            batch_accept_draft_tokens=recv_obj.batch_accept_draft_tokens,
+            output_extra_infos=recv_obj.output_extra_infos,
+            generated_time=recv_obj.generated_time
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
@@ -256,11 +291,13 @@ def run_detokenizer_process(
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
+    register_usr_signal()
 
     try:
         manager = DetokenizerManager(server_args, port_args)
         manager.event_loop()
     except Exception:
+        manager.maybe_clear_socket_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)
+        parent_process.send_signal(signal.SIGUSR1)

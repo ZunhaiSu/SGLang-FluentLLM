@@ -4,7 +4,7 @@ import unittest
 import requests
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import kill_process_tree, maybe_model_redirect
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 class TestInputEmbeds(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = maybe_model_redirect(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model)
         cls.ref_model = AutoModelForCausalLM.from_pretrained(cls.model)

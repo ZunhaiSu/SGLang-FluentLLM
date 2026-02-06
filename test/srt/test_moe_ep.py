@@ -26,7 +26,8 @@ class TestEpMoE(unittest.TestCase):
                 "2",
                 "--ep-size",
                 "2",
-                "--enable-ep-moe",
+                "--moe-parallel-strategy",
+                "ep",
             ],
         )
 

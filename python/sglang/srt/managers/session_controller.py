@@ -10,12 +10,11 @@
 # limitations under the License.
 # ==============================================================================
 
-import logging
 import uuid
 from typing import Dict, Optional
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.req import Req
 
 
 class SessionReqNode:
@@ -37,6 +36,7 @@ class SessionReqNode:
 
         if self.req.finished_reason is None:
             self.req.to_abort = True
+
         del req_dict[self.req.rid]
 
     def abort(self):
@@ -64,7 +64,7 @@ class Session:
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
         self.req_nodes: Dict[str, SessionReqNode] = {}
-
+    
     def create_req(self, req: TokenizedGenerateReqInput, tokenizer):
         assert req.session_params is not None
         session_params = req.session_params
@@ -129,7 +129,6 @@ class Session:
             origin_input_ids=input_ids,
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
-            lora_path=req.lora_path,
             session_id=self.session_id,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
@@ -137,9 +136,7 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
         )
-        if last_req is not None:
-            new_req.image_inputs = last_req.image_inputs
-        new_req.tokenizer = tokenizer
+        new_req.set_tokenizer(tokenizer)
         if abort:
             new_req.to_abort = True
         else:

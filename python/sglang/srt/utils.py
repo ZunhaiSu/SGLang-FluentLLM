@@ -16,6 +16,7 @@
 import base64
 import ctypes
 import dataclasses
+import functools
 import io
 import ipaddress
 import itertools
@@ -34,13 +35,30 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import warnings
+from collections import OrderedDict
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
-from multiprocessing import Pool
 from multiprocessing.reduction import ForkingPickler
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+from contextlib import contextmanager
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    Sequence,
+)
 
 import numpy as np
 import psutil
@@ -63,12 +81,12 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
+from pathlib import Path
+from pydantic import BaseModel
 
-logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
-
 
 def is_hip() -> bool:
     """Return whether it is HIP on the AMD ROCm platform."""
@@ -77,6 +95,13 @@ def is_hip() -> bool:
 
 def is_cuda():
     return hasattr(torch, "cuda") and torch.version.cuda is not None
+
+
+def get_device_sm():
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    return 0
 
 
 def is_cuda_alike():
@@ -90,6 +115,11 @@ def is_hpu() -> bool:
 def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
+
+def is_npu() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+_is_npu = is_npu()
 
 def is_flashinfer_available():
     """
@@ -221,6 +251,16 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         free_gpu_memory = psutil.virtual_memory().available
+    elif device == "npu":
+        num_gpus = torch.npu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.npu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
+                "which may cause useless memory allocation for torch NPU context.",
+            )
+        free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
@@ -319,6 +359,10 @@ def make_layers(
     )
     return modules
 
+
+@lru_cache(maxsize=1)
+def get_device_module():
+    return torch.get_device_module()
 
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
@@ -422,6 +466,12 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
+@dataclasses.dataclass
+class ImageData:
+    url: str
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
 def load_image(image_file: Union[str, bytes]):
     from PIL import Image
 
@@ -447,7 +497,6 @@ def load_image(image_file: Union[str, bytes]):
         raise ValueError(f"Invalid image: {image}")
 
     return image, image_size
-
 
 def suppress_other_loggers():
     from vllm.logger import logger as vllm_default_logger
@@ -479,6 +528,12 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
             + message
         )
 
+def register_usr_signal():
+    parent_process = psutil.Process().parent()
+    def signal_handler(sig, frame):
+        logger.error(f"recv usr signal, kill usr signal to parent")
+        parent_process.send_signal(signal.SIGUSR1)
+    signal.signal(signal.SIGUSR1, signal_handler)
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
@@ -533,27 +588,68 @@ def monkey_patch_p2p_access_check():
     setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
 
 
-def monkey_patch_vllm_gguf_config():
-    from vllm.model_executor.layers.quantization.gguf import (
-        GGUFConfig,
-        GGUFEmbeddingMethod,
-        GGUFLinearMethod,
-    )
+LOG_PREFIX = None
+LOG_LEVEL = 'INFO'
 
-    from sglang.srt.layers.linear import LinearBase
-    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-    def get_quant_method_with_embedding_replaced(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
-        if isinstance(layer, LinearBase):
-            return GGUFLinearMethod(self)
-        elif isinstance(layer, VocabParallelEmbedding):
-            # patch to own VocabParallelEmbedding
-            return GGUFEmbeddingMethod(self)
-        return None
+def configure_logger(server_args, prefix: str = ""):
+    global LOG_PREFIX
+    LOG_PREFIX = prefix
 
-    setattr(GGUFConfig, "get_quant_method", get_quant_method_with_embedding_replaced)
+    global LOG_LEVEL
+    LOG_LEVEL = server_args.log_level.upper()
+
+    for _, instance in logging.Logger.manager.loggerDict.items():
+        if isinstance(instance, logging.Logger):
+            for handler in instance.handlers[:]:
+                if isinstance(handler.formatter, CustomFormatter):
+                    instance.setLevel(LOG_LEVEL)
+                    handler.setLevel(LOG_LEVEL)
+                    handler.formatter.FORMATS = None
+
+class CustomFormatter(logging.Formatter):
+
+    grey = "\x1b[38;20m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+
+    FORMATS = None
+
+    def format(self, record):
+        if self.FORMATS is None:
+            # format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
+            format = f"[%(asctime)s {LOG_PREFIX}] - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
+            self.FORMATS = {
+                logging.DEBUG: self.grey + format + self.reset,
+                logging.INFO: self.grey + format + self.reset,
+                logging.WARNING: self.yellow + format + self.reset,
+                logging.ERROR: self.red + format + self.reset,
+                logging.CRITICAL: self.bold_red + format + self.reset
+            }
+
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+
+def get_colorful_logger(name):
+    logger = logging.getLogger(name)
+    logger.propagate = False
+    logger.setLevel(LOG_LEVEL)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(LOG_LEVEL)
+    ch.setFormatter(CustomFormatter())
+    # ch.flush = lambda: True
+
+    logger.addHandler(ch)
+    logger.propagate = False
+    return logger
+
+
+logger = get_colorful_logger(__name__)
 
 
 def maybe_set_triton_cache_manager() -> None:
@@ -629,17 +725,6 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
     return model_path, tokenizer_path
 
 
-def configure_logger(server_args, prefix: str = ""):
-    format = f"[%(asctime)s{prefix}] %(message)s"
-    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
-
-
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
 def replace_submodule(
     model: nn.Module, module_name: str, new_module: nn.Module
@@ -670,19 +755,24 @@ def set_weight_attrs(
         assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
         setattr(weight, key, value)
 
+def broadcast_wrapper(tensor_size, group_src, dist_group):
+    if not _is_npu:
+        return dist.broadcast(tensor_size, group_src=group_src, group=dist_group)
+    else:
+        return dist.broadcast(tensor_size, src=group_src, group=dist_group)
 
 def broadcast_pyobj(
     data: List[Any],
-    rank: int,
+    group_rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
-    src: int = 0,
+    group_src: int = 0,
 ):
-    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
+    """Broadcast inputs from group_rank=0 to all other ranks with torch.dist backend."""
 
-    if rank == 0:
+    if group_rank == 0:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.broadcast(tensor_size, src=src, group=dist_group)
+            broadcast_wrapper(tensor_size, group_src, dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -691,19 +781,19 @@ def broadcast_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.broadcast(tensor_size, src=src, group=dist_group)
-            dist.broadcast(tensor_data, src=src, group=dist_group)
+            broadcast_wrapper(tensor_size, group_src, dist_group)
+            broadcast_wrapper(tensor_data, group_src, dist_group)
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.broadcast(tensor_size, src=src, group=dist_group)
+        broadcast_wrapper(tensor_size, group_src, dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.broadcast(tensor_data, src=src, group=dist_group)
+        broadcast_wrapper(tensor_data, group_src, dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
@@ -747,7 +837,6 @@ def first_rank_print(*args, **kwargs):
     else:
         pass
 
-
 def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
 ):
@@ -760,12 +849,24 @@ def get_zmq_socket(
         buf_size = -1
 
     socket = context.socket(socket_type)
-    if socket_type == zmq.PUSH:
+    if endpoint.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
+
+    def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-    elif socket_type == zmq.PULL:
+
+    def set_recv_opt():
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
+
+    if socket_type == zmq.PUSH:
+        set_send_opt()
+    elif socket_type == zmq.PULL:
+        set_recv_opt()
+    elif socket_type == zmq.DEALER:
+        set_send_opt()
+        set_recv_opt()
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
@@ -775,6 +876,7 @@ def get_zmq_socket(
         socket.connect(endpoint)
 
     return socket
+
 
 
 def dump_to_file(dirpath, name, value):
@@ -1051,6 +1153,9 @@ def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu.get_device_name(device_id)
 
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu.get_device_name(device_id)
+
 
 def get_device_core_count(device_id: int = 0) -> int:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
@@ -1086,6 +1191,13 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        import torchair
+
+        config = torchair.CompilerConfig()
+        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        return npu_backend
 
     return "inductor"
 
@@ -1158,24 +1270,47 @@ def set_gpu_proc_affinity(
     start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
     end_cpu_id = start_cpu_id + num_cores_bind
 
-    if psutil.cpu_count() != psutil.cpu_count(logical=False):
-        # HT on
-        lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
+    # if psutil.cpu_count() != psutil.cpu_count(logical=False):
+    #     # HT on
+    #     lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+    #     upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
+    #     bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
+    # else:
+    #     # HT off
+    #     bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+    if gpu_id == 7:
+        bind_cpu_ids = [144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155]
     else:
-        # HT off
         bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+    logger.warning(
+        f"gpu_id: {gpu_id} tp_size: {tp_size} nnodes: {nnodes} total_pcores: {total_pcores} "
+        f"hope bind_cpu_ids: {bind_cpu_ids}"
+    )
 
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
-    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+    logger.warning(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
 
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+def get_str_env_var(name: str, default: str = "") -> str:
+    value = os.getenv(name, default)
+    if value is None:
+        return default
+    return value
 
 @lru_cache(maxsize=8)
 def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
@@ -1366,6 +1501,13 @@ def get_ip() -> str:
         return host_ip
 
     # IP is not set, try to get it from the network interface
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+            return ip
+    except Exception:
+        pass
 
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1466,3 +1608,402 @@ def set_cuda_arch():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def add_prefix(name: str, prefix: str) -> str:
+    """Add a weight path prefix to a module name.
+
+    Args:
+        name: base module name.
+        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
+
+    Returns:
+        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
+    """
+    return name if not prefix else f"{prefix}.{name}"
+
+def next_power_of_2(n: int):
+    return 1 << (n - 1).bit_length() if n > 0 else 1
+
+def split_array_by_half_sum(arr: Sequence[int]) -> int:
+    overall_sum = sum(arr)
+    accumulator, split_index = 0, 0
+    for value in arr[:-1]:
+        accumulator += value
+        split_index += 1
+        if accumulator >= overall_sum // 2:
+            break
+    return split_index
+
+
+setattr(triton, "next_power_of_2", next_power_of_2)
+
+
+def get_free_port():
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+
+def get_local_ip_by_remote() -> str:
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+            return ip
+    except Exception:
+        pass
+
+    # try ipv4
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        pass
+
+    # try ipv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        # Google's public DNS server, see
+        # https://developers.google.com/speed/public-dns/docs/using#addresses
+        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except Exception:
+        raise ValueError(f"Can not get local ip")
+
+def lru_cache_frozenset(maxsize=128):
+    def _to_hashable(o):
+        try:
+            hash(o)
+            return o
+        except TypeError:
+            # Not hashable; convert based on type
+            if isinstance(o, (dict)):
+                return frozenset(
+                    (_to_hashable(k), _to_hashable(v)) for k, v in o.items()
+                )
+            elif isinstance(o, set):
+                return frozenset(_to_hashable(v) for v in o)
+            elif isinstance(o, (list, tuple)) or (
+                isinstance(o, Sequence) and not isinstance(o, (str, bytes))
+            ):
+                return tuple(_to_hashable(v) for v in o)
+            else:
+                raise TypeError(f"Cannot make hashable: {type(o)}")
+
+    def decorator(func):
+        cache = OrderedDict()
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            h_args = tuple(_to_hashable(a) for a in args)
+            h_kwargs = frozenset(
+                (_to_hashable(k), _to_hashable(v)) for k, v in kwargs.items()
+            )
+            key = (h_args, h_kwargs)
+            if key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+            result = func(*args, **kwargs)
+            cache[key] = result
+            if maxsize is not None and len(cache) > maxsize:
+                cache.popitem(last=False)
+            return result
+
+        wrapper.cache_clear = cache.clear  # For manual cache clearing
+        return wrapper
+
+    return decorator
+
+def _maybe_json_dict(path: Union[str, os.PathLike]) -> dict[str, str]:
+    with open(path) as f:
+        try:
+            return json.loads(f.read())
+        except Exception:
+            return dict[str, str]()
+
+
+def _maybe_space_split_dict(path: Union[str, os.PathLike]) -> dict[str, str]:
+    parsed_dict = dict[str, str]()
+    with open(path) as f:
+        for line in f.readlines():
+            try:
+                model_name, redirect_name = line.strip().split()
+                parsed_dict[model_name] = redirect_name
+            except Exception:
+                pass
+    return parsed_dict
+
+
+def maybe_model_redirect(model: str) -> str:
+    """
+    Use model_redirect to redirect the model name to a local folder.
+
+    :param model: hf model name
+    :return: maybe redirect to a local folder
+    """
+
+    model_redirect_path = os.environ.get("SGLANG_MODEL_REDIRECT_PATH")
+
+    if not model_redirect_path:
+        return model
+
+    if not Path(model_redirect_path).exists():
+        return model
+
+    redirect_dict = (_maybe_json_dict(model_redirect_path)
+                     or _maybe_space_split_dict(model_redirect_path))
+    if (redirect_model := redirect_dict.get(model)):
+        logger.info("model redirect: [ %s ] -> [ %s ]", model, redirect_model)
+        return redirect_model
+
+    return model
+
+T = TypeVar("T")
+
+
+class Withable(Generic[T]):
+    def __init__(self):
+        self._value: Optional[T] = None
+
+    @property
+    def value(self) -> T:
+        return self._value
+
+    @contextmanager
+    def with_value(self, new_value: T):
+        assert self._value is None
+        self._value = new_value
+        try:
+            yield
+        finally:
+            assert self._value is new_value
+            self._value = None
+def pad_vocab_size(vocab_size: int, pad_to: int) -> int:
+    """Calculate how much padding is needed for the vocabulary size to be a multiple of the specified size."""
+    return ((vocab_size + pad_to - 1) // pad_to) * pad_to
+
+class LazyValue:
+    def __init__(self, creator: Callable):
+        self._creator = creator
+        self._value = None
+
+    @property
+    def value(self):
+        if self._creator is not None:
+            self._value = self._creator()
+            self._creator = None
+        return self._value
+
+
+def retry(
+    fn,
+    max_retry: int,
+    initial_delay: float = 2.0,
+    max_delay: float = 60.0,
+    should_retry: Callable[[Any], bool] = lambda e: True,
+):
+    for try_index in itertools.count():
+        try:
+            return fn()
+        except Exception as e:
+            if try_index >= max_retry:
+                raise Exception(f"retry() exceed maximum number of retries.")
+
+            if not should_retry(e):
+                raise Exception(f"retry() observe errors that should not be retried.")
+
+            delay = min(initial_delay * (2**try_index), max_delay) * (
+                0.75 + 0.25 * random.random()
+            )
+
+            logger.warning(
+                f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
+            )
+            traceback.print_exc()
+
+            time.sleep(delay)
+
+
+class ConcurrentCounter:
+    """
+    An asynchronous counter for managing concurrent tasks that need
+    coordinated increments, decrements, and waiting until the count reaches zero.
+
+    This class is useful for scenarios like tracking the number of in-flight tasks
+    and waiting for them to complete.
+    """
+
+    def __init__(self, initial: int = 0):
+        """
+        Initialize the counter with an optional initial value.
+
+        Args:
+            initial (int): The initial value of the counter. Default is 0.
+        """
+        self._count = initial
+        self._condition = asyncio.Condition()
+
+    def value(self) -> int:
+        """
+        Return the current value of the counter.
+
+        Note:
+            This method is not synchronized. It may return a stale value
+            if other coroutines are concurrently modifying the counter.
+
+        Returns:
+            int: The current counter value.
+        """
+        return self._count
+
+    def __repr__(self) -> str:
+        """Return an informative string representation of the counter."""
+        return f"<ConcurrentCounter value={self.value()}>"
+
+    async def increment(self, n: int = 1, notify_all: bool = True):
+        """
+        Atomically increment the counter by a given amount and notify all waiters.
+
+        Args:
+            n (int): The amount to increment the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after incrementing. Default is True.
+        """
+        async with self._condition:
+            self._count += n
+            if notify_all:
+                self._condition.notify_all()
+
+    async def decrement(self, n: int = 1, notify_all: bool = True):
+        """
+        Atomically decrement the counter by a given amount and notify all waiters.
+
+        Args:
+            n (int): The amount to decrement the counter by. Default is 1.
+            notify_all (bool): Whether to notify all waiters after decrementing. Default is True.
+        """
+        async with self._condition:
+            self._count -= n
+            if notify_all:
+                self._condition.notify_all()
+
+    async def wait_for(self, condition: Callable[[int], bool]):
+        """
+        Asynchronously wait until the counter satisfies a given condition.
+
+        This suspends the calling coroutine without blocking the thread, allowing
+        other tasks to run while waiting. When the condition is met, the coroutine resumes.
+
+        Args:
+            condition (Callable[[int], bool]): A function that takes the current counter value
+                and returns True when the condition is satisfied.
+        """
+        async with self._condition:
+            await self._condition.wait_for(lambda: condition(self._count))
+
+    async def wait_for_zero(self):
+        """
+        Asynchronously wait until the counter reaches zero.
+
+        This suspends the calling coroutine without blocking the thread, allowing
+        other tasks to run while waiting. When the counter becomes zero, the coroutine resumes.
+        """
+        self.wait_for(lambda count: count == 0)
+
+
+def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
+    import huggingface_hub as hf
+
+    # Build cache path
+    cache_path = os.path.join(
+        hf.constants.HF_HUB_CACHE,
+        hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
+    )
+
+    # Get revision from main ref if not specified
+    if not revision:
+        ref_path = os.path.join(cache_path, "refs", "main")
+        if os.path.isfile(ref_path):
+            with open(ref_path) as f:
+                revision = f.read().strip()
+
+    # List files from revision directory
+    if revision:
+        rev_dir = os.path.join(cache_path, "snapshots", revision)
+        if os.path.isdir(rev_dir):
+            return rev_dir
+
+    return None
+
+
+def read_system_prompt_from_file(model_name: str) -> str:
+    """Read system prompt from a file in the HuggingFace cache directory.
+
+    Args:
+        model_name: The model name to construct the file path
+
+    Returns:
+        The system prompt content from the file, or empty string if file not found
+    """
+    try:
+        local_repo_dir = find_local_repo_dir(model_name)
+        if local_repo_dir:
+            system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
+            if os.path.exists(system_prompt_file):
+                with open(system_prompt_file, "r", encoding="utf-8") as f:
+                    return f.read()
+
+        return ""
+    except Exception:
+        # If anything fails, return empty string
+        return ""
+
+def random_uuid() -> str:
+    return str(uuid.uuid4().hex)
+
+
+def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
+    """Convert a JSON schema to a string.
+    Parameters
+    ----------
+    json_schema
+        The JSON schema.
+    Returns
+    -------
+    str
+        The JSON schema converted to a string.
+    Raises
+    ------
+    ValueError
+        If the schema is not a dictionary, a string or a Pydantic class.
+    """
+    if isinstance(json_schema, dict):
+        schema_str = json.dumps(json_schema)
+    elif isinstance(json_schema, str):
+        schema_str = json_schema
+    elif issubclass(json_schema, BaseModel):
+        schema_str = json.dumps(json_schema.model_json_schema())
+    else:
+        raise ValueError(
+            f"Cannot parse schema {json_schema}. The schema must be either "
+            + "a Pydantic class, a dictionary or a string that contains the JSON "
+            + "schema specification"
+        )
+    return schema_str
+
+# COPIED FROM DeepGEMM
+def align(x: int, y: int) -> int:
+    return ceil_div(x, y) * y
+
+
+# COPIED FROM DeepGEMM
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y

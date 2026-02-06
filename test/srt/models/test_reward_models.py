@@ -18,6 +18,7 @@ import unittest
 import torch
 
 from sglang.test.runners import HFRunner, SRTRunner
+from sglang.srt.utils import maybe_model_redirect
 
 MODELS = [
     ("LxzGordon/URM-LLaMa-3.1-8B", 1, 4e-2),
@@ -55,6 +56,7 @@ class TestRewardModels(unittest.TestCase):
         torch_dtype,
         tolerance,
     ) -> None:
+        model_path = maybe_model_redirect(model_path)
         with HFRunner(
             model_path,
             torch_dtype=torch_dtype,

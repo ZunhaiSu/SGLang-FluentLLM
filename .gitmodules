@@ -1,12 +1,33 @@
-[submodule "sgl-kernel/3rdparty/cutlass"]
-	path = sgl-kernel/3rdparty/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
-[submodule "sgl-kernel/3rdparty/cccl"]
-	path = sgl-kernel/3rdparty/cccl
-	url = https://github.com/NVIDIA/cccl.git
-[submodule "sgl-kernel/3rdparty/flashinfer"]
-	path = sgl-kernel/3rdparty/flashinfer
-	url = https://github.com/flashinfer-ai/flashinfer.git
-[submodule "sgl-kernel/3rdparty/turbomind"]
-	path = sgl-kernel/3rdparty/turbomind
-	url = https://github.com/InternLM/turbomind
+[submodule "3rdparty/flashinfer"]
+	path = 3rdparty/flashinfer
+	url = https://github.com/meituan-longcat/flashinfer.git
+[submodule "3rdparty/flashmla"]
+	path = 3rdparty/flashmla
+	url = https://github.com/meituan-longcat/FlashMLA.git
+[submodule "3rdparty/flashmla-fp8"]
+	path = 3rdparty/flashmla-fp8
+	url = https://github.com/meituan-longcat/FlashMLA.git
+[submodule "3rdparty/flashmla-swap"]
+	path = 3rdparty/flashmla-swap
+	url = https://github.com/meituan-longcat/FlashMLA.git
+[submodule "3rdparty/deep_ep"]
+	path = 3rdparty/deep_ep
+	url = https://github.com/meituan-longcat/DeepEP.git
+[submodule "3rdparty/eps"]
+	path = 3rdparty/eps
+	url = https://github.com/meituan-longcat/eps.git
+[submodule "3rdparty/deep_gemm"]
+	path = 3rdparty/deep_gemm
+	url = https://github.com/meituan-longcat/DeepGEMM.git
+[submodule "3rdparty/deep_gemm_oss"]
+	path = 3rdparty/deep_gemm_oss
+	url = https://github.com/meituan-longcat/DeepGEMM.git
+[submodule "3rdparty/fast-hadamard-transform"]
+	path = 3rdparty/fast-hadamard-transform
+	url = https://github.com/meituan-longcat/fast-hadamard-transform.git
+[submodule "3rdparty/triton_configs"]
+	path = 3rdparty/triton_configs
+	url = https://github.com/meituan-longcat/triton_configs.git
+[submodule "3rdparty/flash-attention"]
+	path = 3rdparty/flash-attention
+	url = https://github.com/Dao-AILab/flash-attention

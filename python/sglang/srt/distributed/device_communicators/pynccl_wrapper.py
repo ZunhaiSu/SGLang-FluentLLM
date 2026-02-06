@@ -22,7 +22,7 @@
 # variable in the code.
 
 import ctypes
-import logging
+from sglang.srt.utils import get_colorful_logger
 import os
 import platform
 from dataclasses import dataclass
@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.distributed import ReduceOp
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 def find_nccl_library() -> str:

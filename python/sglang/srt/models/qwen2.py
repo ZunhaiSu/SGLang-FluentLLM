@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_group, get_dense_tp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -33,10 +34,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import get_rope, RotaryEmbeddingCosSinCache
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -48,8 +48,10 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import make_layers
 
-Qwen2Config = None
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 
+Qwen2Config = None
 
 class Qwen2MLP(nn.Module):
     def __init__(
@@ -71,6 +73,7 @@ class Qwen2MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=False
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -134,6 +137,7 @@ class Qwen2Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=False
         )
 
         self.rotary_emb = get_rope(
@@ -197,6 +201,7 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.layer_id = layer_id
 
     def forward(
         self,
@@ -204,13 +209,17 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        else:
+        elif forward_batch.input_ids.shape[0] > global_server_args_dict["flashinfer_comm_max_num_tokens"]:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        else:
+            hidden_states, residual, _ = self.input_layernorm.forward_with_allreduce_fusion(get_dense_tp_group(), hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -218,16 +227,20 @@ class Qwen2DecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if forward_batch.input_ids.shape[0] > global_server_args_dict["flashinfer_comm_max_num_tokens"]:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        else:
+            hidden_states, residual, _ = self.post_attention_layernorm.forward_with_allreduce_fusion(get_attention_tp_group(), hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
 class Qwen2Model(nn.Module):
-    def __init__(
-        self,
+    def __init__( self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
     ) -> None:
         super().__init__()
         self.config = config
@@ -238,15 +251,26 @@ class Qwen2Model(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
         )
+        # Use the provided decoder layer type or default to Qwen2DecoderLayer
+        decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
         self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: Qwen2DecoderLayer(
+            lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
             ),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if global_server_args_dict["npu_enable_opt_rope"]:
+            head_dim = getattr(self.config, "head_dim", None)
+            max_position_embeddings = getattr(self.config, "max_position_embeddings", None)
+            rope_theta = getattr(self.config, "rope_theta", None)
+            self.rotary_pos_emb = RotaryEmbeddingCosSinCache(
+                head_dim, max_position_embeddings=max_position_embeddings, base=rope_theta,
+                device="npu",
+            )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -266,6 +290,15 @@ class Qwen2Model(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
+
+        cos, sin = None, None
+        if global_server_args_dict["npu_enable_opt_rope"]:
+            max_position_embeddings = getattr(self.config, "max_position_embeddings", None)
+            cos, sin = self.rotary_pos_emb(hidden_states, max_position_embeddings)
+            cos = cos[positions]
+            sin = sin[positions]
+            cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -273,8 +306,13 @@ class Qwen2Model(nn.Module):
                 hidden_states,
                 forward_batch,
                 residual,
+                cos_sin=(cos, sin),
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if forward_batch.input_ids.shape[0] > global_server_args_dict["flashinfer_comm_max_num_tokens"]:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            hidden_states, _, _ = self.norm.forward_with_allreduce_fusion(get_dense_tp_group(), hidden_states, residual)
         return hidden_states
 
     # If this function is called, it should always initialize KV cache scale
@@ -337,7 +375,6 @@ class Qwen2ForCausalLM(nn.Module):
                 config.vocab_size, config.hidden_size, quant_config=quant_config
             )
         self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -352,12 +389,9 @@ class Qwen2ForCausalLM(nn.Module):
         get_embedding: bool = False,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            return self.pooler(hidden_states, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

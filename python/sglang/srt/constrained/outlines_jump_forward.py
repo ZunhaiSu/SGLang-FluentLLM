@@ -17,7 +17,7 @@ Reference: https://lmsys.org/blog/2024-02-05-compressed-fsm/
 """
 
 import dataclasses
-import logging
+from sglang.srt.utils import get_colorful_logger
 from collections import defaultdict
 
 import interegular
@@ -34,7 +34,7 @@ except ImportError:
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
 
 
 @dataclasses.dataclass

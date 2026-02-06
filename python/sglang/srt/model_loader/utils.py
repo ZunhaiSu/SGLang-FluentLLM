@@ -8,6 +8,10 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.utils import get_colorful_logger
+
+
+logger = get_colorful_logger(__name__)
 
 
 @contextlib.contextmanager
@@ -34,6 +38,11 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     ):
         architectures = ["QuantMixtralForCausalLM"]
 
+    if "LlamaForCausalLM_MoE" in architectures:
+        architectures = ["LlamaForCausalLMMoE"]
+
+    if model_config.enable_tbo or model_config.enable_sbo:
+        architectures = [f"{arch}Overlap" if "NextN" not in arch else arch for arch in architectures]
     return ModelRegistry.resolve_model_cls(architectures)
 
 
